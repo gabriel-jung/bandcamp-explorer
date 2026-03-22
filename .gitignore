@@ -1,0 +1,33 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.pytest_cache/
+
+# Environments
+.env
+.venv
+
+# Tool caches
+.ruff_cache/
+.mypy_cache/
+.idea/
+.vscode/
+.claude/
+
+# OS-specific
+.DS_Store
+Thumbs.db
