@@ -1,4 +1,4 @@
-# pybandcamp
+# bandcamp-explorer
 
 A terminal browser and Python library for [Bandcamp](https://bandcamp.com).
 
@@ -8,16 +8,16 @@ browse artist/label profiles and discographies — all from the command line.
 ## Install
 
 ```bash
-pip install pybandcamp
+pip install bandcamp-explorer
 # or
-uv tool install pybandcamp
+uv tool install bandcamp-explorer
 ```
 
 For local development:
 
 ```bash
-git clone https://github.com/gabriel-jung/pybandcamp.git
-cd pybandcamp
+git clone https://github.com/gabriel-jung/bandcamp-explorer.git
+cd bandcamp-explorer
 uv sync
 ```
 
@@ -73,7 +73,7 @@ bandcamp https://erang.bandcamp.com/album/tome-iv --json
 ## Library
 
 ```python
-from pybandcamp.core import BandcampClient, AlbumAPI, ArtistAPI, DiscoverAPI, SearchAPI
+from bandcamp_explorer.core import BandcampClient, AlbumAPI, ArtistAPI, DiscoverAPI, SearchAPI
 
 with BandcampClient() as client:
     # Search
@@ -95,7 +95,7 @@ with BandcampClient() as client:
         print(f"  {item['title']}")
 
     # Location filtering
-    from pybandcamp.core import resolve_location
+    from bandcamp_explorer.core import resolve_location
     tag_id = resolve_location(client, "paris")
     releases, _ = discover.discover(tags=["dungeon-synth", tag_id])
 ```

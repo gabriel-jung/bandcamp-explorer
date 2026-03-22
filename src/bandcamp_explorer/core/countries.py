@@ -16,7 +16,7 @@ from pathlib import Path
 
 from loguru import logger
 
-CACHE_DIR = Path.home() / ".cache" / "pybandcamp"
+CACHE_DIR = Path.home() / ".cache" / "bandcamp-explorer"
 CACHE_FILE = CACHE_DIR / "locations.json"
 
 DISCOVER_URL = "https://bandcamp.com/discover/{slug}"

@@ -1,4 +1,4 @@
-"""Public API surface for the pybandcamp core library."""
+"""Public API surface for the bandcamp_explorer core library."""
 
 from .api import AlbumAPI, ArtistAPI, DiscoverAPI, SearchAPI
 from .client import BandcampClient
