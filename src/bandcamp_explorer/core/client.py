@@ -45,6 +45,12 @@ class BandcampClient:
             response = self._session.get(url, params=params, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             return response.text
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                logger.warning(f"Not found (404): {url}")
+                raise
+            logger.error(f"GET failed for {url}: {e}")
+            return None
         except Exception as e:
             logger.error(f"GET failed for {url}: {e}")
             return None
