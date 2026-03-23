@@ -78,7 +78,7 @@ def _key_value_grid(rows: list[tuple[str, str]]) -> Table:
     return grid
 
 
-def show_text_panel(text: str | None, title: str) -> None:
+def _show_text_panel(text: str | None, title: str) -> None:
     """Show text in a bordered panel, or a 'not available' message."""
     if text:
         console.print()
@@ -90,39 +90,39 @@ def show_text_panel(text: str | None, title: str) -> None:
 # --- Search Result ---
 
 
-def display_search_band_summary(d: dict) -> None:
+def display_search_band_summary(result: dict) -> None:
     """One-line: type + name + location + genre."""
-    location = d.get("location") or ""
-    genre = d.get("genre") or ""
+    location = result.get("location") or ""
+    genre = result.get("genre") or ""
     console.print(
-        f"[dim]artist[/dim]  [bold]{d.get('name', '')}[/bold]  [dim]{location}[/dim]  {genre}"
+        f"[dim]artist[/dim]  [bold]{result.get('name', '')}[/bold]  [dim]{location}[/dim]  {genre}"
     )
 
 
-def display_search_album_summary(d: dict) -> None:
+def display_search_album_summary(result: dict) -> None:
     """One-line: type + name + by artist."""
-    subhead = d.get("subhead") or ""
+    subhead = result.get("subhead") or ""
     console.print(
-        f"[dim]album [/dim]  [bold]{d.get('name', '')}[/bold]  [dim]{subhead}[/dim]"
+        f"[dim]album [/dim]  [bold]{result.get('name', '')}[/bold]  [dim]{subhead}[/dim]"
     )
 
 
-def display_search_track_summary(d: dict) -> None:
+def display_search_track_summary(result: dict) -> None:
     """One-line: type + name + from album by artist."""
-    subhead = d.get("subhead") or ""
+    subhead = result.get("subhead") or ""
     console.print(
-        f"[dim]track [/dim]  [bold]{d.get('name', '')}[/bold]  [dim]{subhead}[/dim]"
+        f"[dim]track [/dim]  [bold]{result.get('name', '')}[/bold]  [dim]{subhead}[/dim]"
     )
 
 
 # --- Release Summary (from DiscoverAPI) ---
 
 
-def display_release_summary(d: dict) -> None:
+def display_release_summary(release: dict) -> None:
     """One-line: artist - title + genre."""
-    genre = d.get("genre", "")
+    genre = release.get("genre", "")
     console.print(
-        f"[bold]{d.get('artist_name', '')}[/bold] - {d.get('title', '')}"
+        f"[bold]{release.get('artist_name', '')}[/bold] - {release.get('title', '')}"
         f"  [dim]{genre}[/dim]"
     )
 
@@ -130,11 +130,11 @@ def display_release_summary(d: dict) -> None:
 # --- Album ---
 
 
-def display_album_summary(d: dict) -> None:
+def display_album_summary(album: dict) -> None:
     """One-line: artist - title + first 3 tags."""
-    tags = ", ".join(d.get("tags", [])[:3])
+    tags = ", ".join(album.get("tags", [])[:3])
     console.print(
-        f"[bold]{d.get('artist_name', '')}[/bold] - {d.get('title', '')}"
+        f"[bold]{album.get('artist_name', '')}[/bold] - {album.get('title', '')}"
         f"  [dim]{tags}[/dim]"
     )
 
@@ -150,55 +150,55 @@ def _format_date(raw: str | None) -> str:
         return raw
 
 
-def display_album_header(d: dict) -> None:
+def display_album_header(album: dict) -> None:
     """Info panel with artist, date, tags, and location. Shows cover art."""
-    artist = d.get("artist", {})
-    tags = ", ".join(d.get("tags", []))
+    artist = album.get("artist", {})
+    tags = ", ".join(album.get("tags", []))
 
-    artist_name = d.get("artist_name", "")
+    artist_name = album.get("artist_name", "")
     host_name = artist.get("name", "")
     same = not host_name or host_name == artist_name
 
     rows = [("Artist", artist_name)]
     if not same:
         rows.append(("Host", host_name))
-    if d.get("label"):
-        rows.append(("Label", d["label"]))
+    if album.get("label"):
+        rows.append(("Label", album["label"]))
 
     # Format release type for display
-    release_type = d.get("release_type", "")
+    release_type = album.get("release_type", "")
     if release_type:
         release_type = release_type.replace("Release", "").strip()
-    formats = ", ".join(d.get("formats", []))
+    formats = ", ".join(album.get("formats", []))
 
     rows.extend(
         [
-            ("Date", _format_date(d.get("release_date"))),
+            ("Date", _format_date(album.get("release_date"))),
             ("Type", release_type),
             ("Formats", formats),
-            ("Catalog", d.get("catalog", "")),
+            ("Catalog", album.get("catalog", "")),
             ("Tags", tags),
             ("Location", artist.get("location", "")),
-            ("URL", d.get("url", "")),
+            ("URL", album.get("url", "")),
         ]
     )
 
-    if d.get("num_supporters"):
-        rows.append(("Supporters", str(d["num_supporters"])))
+    if album.get("num_supporters"):
+        rows.append(("Supporters", str(album["num_supporters"])))
     info = _key_value_grid(rows)
 
     console.print()
-    title = f"[bold]{d.get('title', '')}[/bold]"
+    title = f"[bold]{album.get('title', '')}[/bold]"
     panel = Panel(info, title=title, border_style="blue")
-    _show_image_beside(d.get("_art_data"), panel)
+    _show_image_beside(album.get("_art_data"), panel)
 
 
-def display_album_details(d: dict) -> None:
+def display_album_details(album: dict) -> None:
     """Full album view: header + tracklist + description + lyrics."""
-    display_album_header(d)
-    _print_tracklist(d.get("tracks", []))
-    show_text_panel(d.get("description"), "Description")
-    _print_lyrics(d.get("tracks", []))
+    display_album_header(album)
+    _print_tracklist(album.get("tracks", []))
+    _show_text_panel(album.get("description"), "Description")
+    _print_lyrics(album.get("tracks", []))
 
 
 def _print_lyrics(tracks: list[dict]) -> None:
@@ -255,31 +255,31 @@ def _print_tracklist(tracks: list[dict]) -> None:
 # --- Artist ---
 
 
-def display_artist_summary(d: dict) -> None:
+def display_artist_summary(artist: dict) -> None:
     """One-line: artist name + location."""
-    location = d.get("location") or ""
-    console.print(f"[bold]{d.get('name', '')}[/bold]  [dim]{location}[/dim]")
+    location = artist.get("location") or ""
+    console.print(f"[bold]{artist.get('name', '')}[/bold]  [dim]{location}[/dim]")
 
 
-def display_artist_header(d: dict) -> None:
+def display_artist_header(artist: dict) -> None:
     """Info panel with location and URL. Shows artist photo."""
     rows = [
-        ("Location", d.get("location", "")),
-        ("Label", d.get("label", "")),
-        ("URL", d.get("url", "")),
+        ("Location", artist.get("location", "")),
+        ("Label", artist.get("label", "")),
+        ("URL", artist.get("url", "")),
     ]
     info = _key_value_grid(rows)
 
     console.print()
-    title = f"[bold]{d.get('name', '')}[/bold]"
+    title = f"[bold]{artist.get('name', '')}[/bold]"
     panel = Panel(info, title=title, border_style="blue")
-    _show_image_beside(d.get("_art_data"), panel)
+    _show_image_beside(artist.get("_art_data"), panel)
 
 
-def display_artist_details(d: dict) -> None:
+def display_artist_details(artist: dict) -> None:
     """Full artist view: header + bio."""
-    display_artist_header(d)
-    show_text_panel(d.get("bio"), "Bio")
+    display_artist_header(artist)
+    _show_text_panel(artist.get("bio"), "Bio")
 
 
 # --- Dispatch dicts ---

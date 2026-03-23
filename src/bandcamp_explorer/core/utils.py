@@ -58,7 +58,10 @@ def format_duration(total_seconds: int) -> str:
 def art_url(art_id: str | None, size: int = 2) -> str | None:
     """Build a Bandcamp album art URL from an art_id.
 
-    Sizes: 1=65px, 2=350px, 3=100px, 5=700px, 7=150px, 10=1200px.
+    Square sizes: 3=100, 7=150, 9=210, 4/23/24=300, 2=350, 13=380,
+    5/16/25=700, 20=1024, 10=1200, 0/1=1400.
+    Non-square: 26=800x600, 27=715x402, 28=768x432, 29=100x75.
+    Other: 6=100, 8=124, 11=172, 12=138, 14=368, 15=135, 21=120, 22=25.
     Default is 2 (350px), good for terminal display.
     """
     if not art_id:

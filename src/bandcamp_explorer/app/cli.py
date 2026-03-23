@@ -15,6 +15,7 @@ import sys
 
 from loguru import logger
 
+from .. import __version__
 from ..core.api import AlbumAPI, ArtistAPI, DiscoverAPI, SearchAPI
 from ..core.client import BandcampClient
 from ..core.countries import resolve_location
@@ -99,13 +100,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version="%(prog)s 0.1.0",
+        version=f"%(prog)s {__version__}",
     )
 
     return parser
 
 
-def _resolve_search_type(args) -> str:
+def _resolve_item_type(args) -> str:
     """Determine the item_type filter from --artist, --album, --track flags."""
     if args.artist:
         return "band"
@@ -147,7 +148,7 @@ def _run_search(client: BandcampClient, args) -> None:
     """Text search with paginated results."""
     api = SearchAPI(client)
     query = " ".join(args.query)
-    item_type = _resolve_search_type(args)
+    item_type = _resolve_item_type(args)
 
     # Fetch first page
     current_page = 1
@@ -457,7 +458,7 @@ def _wait_for_back() -> None:
             return
 
 
-_DISCO_PAGE_SIZE = 50
+DISCOGRAPHY_PAGE_SIZE = 50
 
 
 def _browse_discography(
@@ -471,11 +472,11 @@ def _browse_discography(
 ) -> None:
     """Interactive discography browser with pagination."""
     current_page = 1
-    total_pages = (len(items) + _DISCO_PAGE_SIZE - 1) // _DISCO_PAGE_SIZE
+    total_pages = (len(items) + DISCOGRAPHY_PAGE_SIZE - 1) // DISCOGRAPHY_PAGE_SIZE
 
     while True:
-        start = (current_page - 1) * _DISCO_PAGE_SIZE
-        end = min(start + _DISCO_PAGE_SIZE, len(items))
+        start = (current_page - 1) * DISCOGRAPHY_PAGE_SIZE
+        end = min(start + DISCOGRAPHY_PAGE_SIZE, len(items))
         page_items = items[start:end]
 
         # Display numbered list with continuous numbering

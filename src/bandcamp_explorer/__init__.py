@@ -1,3 +1,5 @@
-from . import core, app
+from . import app, core
 
-__all__ = ["core", "app"]
+__version__ = "0.1.0"
+
+__all__ = ["__version__", "app", "core"]
