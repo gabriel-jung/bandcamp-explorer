@@ -1,6 +1,7 @@
 """HTTP client for Bandcamp with rate limiting."""
 
 import time
+from pathlib import Path
 
 import requests
 from loguru import logger
@@ -9,6 +10,10 @@ REQUEST_TIMEOUT = 15
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0",
 }
+
+
+class NotFoundError(Exception):
+    """Raised when a resource returns HTTP 404."""
 
 
 class BandcampClient:
@@ -48,7 +53,7 @@ class BandcampClient:
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
                 logger.warning(f"Not found (404): {url}")
-                raise
+                raise NotFoundError(url) from e
             logger.error(f"GET failed for {url}: {e}")
             return None
         except Exception as e:
@@ -92,6 +97,40 @@ class BandcampClient:
             return response.content
         except Exception as e:
             logger.error(f"GET bytes failed for {url}: {e}")
+            return None
+
+    def download_image(self, url: str, output_dir: str = "./images/") -> str | None:
+        """Download an image to a local file.
+
+        The filename is extracted from the URL (e.g. ``a1234_5.jpg``).
+        Parent directories are created automatically.
+
+        Args:
+            url: Full image URL.
+            output_dir: Local directory to save images under.
+
+        Returns:
+            The path of the saved file as a string, or None if the download
+            failed or ``url`` was empty.
+        """
+        if not url:
+            return None
+
+        try:
+            filename = url.rsplit("/", 1)[-1].split("?")[0]
+            output_path = Path(output_dir) / filename
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            image_data = self.get_bytes(url, crawl=True)
+            if not image_data:
+                return None
+
+            output_path.write_bytes(image_data)
+            logger.debug(f"Downloaded {filename} -> {output_path}")
+            return str(output_path)
+
+        except Exception as e:
+            logger.debug(f"Failed to download {url}: {e}")
             return None
 
     def _wait_between_requests(self, crawl: bool = False):

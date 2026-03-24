@@ -296,6 +296,11 @@ SUMMARY: dict[str, Callable] = {
     "artist": display_artist_summary,
 }
 
+HEADER: dict[str, Callable] = {
+    "album": display_album_header,
+    "artist": display_artist_header,
+}
+
 DETAILS: dict[str, Callable] = {
     "album": display_album_details,
     "artist": display_artist_details,
