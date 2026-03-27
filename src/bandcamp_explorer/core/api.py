@@ -29,9 +29,7 @@ class BaseAPI:
     def __init__(self, client: BandcampClient):
         self._client = client
 
-    def _get_page(
-        self, url: str, parser_class, params: dict | None = None, **kwargs
-    ) -> dict | None:
+    def _get_page(self, url: str, parser_class, params: dict | None = None, **kwargs) -> dict | None:
         """Fetch a page and parse it into a structured dict.
 
         Downloads the HTML, builds a BeautifulSoup tree, and passes it
@@ -44,7 +42,7 @@ class BaseAPI:
         parser = parser_class(BeautifulSoup(html, "html.parser"), url, **kwargs)
         return parser.parse()
 
-    def _fetch_art(self, entity: dict) -> None:
+    def _attach_image(self, entity: dict) -> None:
         """Fetch cover art / photo bytes and attach as ``_art_data``."""
         image = art_url(entity.get("art_id")) or entity.get("image_url")
         if image:
@@ -63,7 +61,7 @@ class AlbumAPI(BaseAPI):
         album = self._get_page(album_url, AlbumPageParser)
         if not album:
             return None
-        self._fetch_art(album)
+        self._attach_image(album)
         return album
 
 
@@ -107,11 +105,11 @@ class DiscoverAPI(BaseAPI):
         items = data.get("items", [])
         results = [
             {
-                "_type": "release_summary",
+                "_type": "album",
                 "album_id": item.get("tralbum_id"),
                 "artist_name": item.get("artist"),
                 "title": item.get("title"),
-                "album_url": item.get("tralbum_url"),
+                "url": item.get("tralbum_url"),
                 "artist_url": item.get("band_url"),
                 "artist_id": item.get("band_id"),
                 "art_id": str(item["art_id"]) if item.get("art_id") else None,
@@ -143,9 +141,7 @@ class DiscoverAPI(BaseAPI):
             if not has_more:
                 break
 
-        logger.info(
-            f"Discovered {len(all_results)} releases across {pages_fetched} pages."
-        )
+        logger.info(f"Discovered {len(all_results)} releases across {pages_fetched} pages.")
         return all_results
 
 
@@ -193,7 +189,7 @@ class ArtistAPI(BaseAPI):
         if not artist:
             return None
 
-        self._fetch_art(artist)
+        self._attach_image(artist)
 
         # Discography lives on /music subpage
         music_url = artist_url.rstrip("/") + "/music"

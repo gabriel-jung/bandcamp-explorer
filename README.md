@@ -7,10 +7,12 @@ browse artist/label profiles and discographies — all from the command line.
 
 ## Install
 
+Requires Python 3.12+.
+
 ```bash
-pip install bandcamp-explorer
-# or
 uv tool install bandcamp-explorer
+# or
+pip install bandcamp-explorer
 ```
 
 For local development:
@@ -53,27 +55,43 @@ bandcamp https://erang.bandcamp.com/album/tome-iv
 bandcamp https://erang.bandcamp.com
 ```
 
-### Navigation
+### Interactive navigation
 
-- Enter a number to select an item from any list
-- `n` / `p` — next / previous page
-- `a` — navigate to artist page (from album)
-- `h` — navigate to host/label page (when different from artist)
-- `0` — go back
-- `Ctrl+C` — quit
+After selecting a result, you enter an interactive browser:
 
-### JSON output
+- **Artists** — view bio, browse discography, select an album to see its
+  tracklist, select a track to view its page, navigate to the label.
+- **Albums** — header with tracklist, description, and lyrics; navigate
+  to the artist/host page or select a track.
+
+Press `0` to go back, `Ctrl+C` to quit.
+
+### Output modes
 
 ```bash
-bandcamp "erang" --artist --json
+bandcamp "erang" --artist --json   # output as JSON
 bandcamp --tag dungeon-synth --json
 bandcamp https://erang.bandcamp.com/album/tome-iv --json
+bandcamp https://erang.bandcamp.com/album/tome-iv --full   # all sections at once
+bandcamp -v ...                    # enable debug logging
 ```
+
+### Terminal images
+
+Album covers and artist images render inline on terminals that support the
+iTerm2 or Kitty image protocol (iTerm2, Kitty, WezTerm, Mintty).
 
 ## Library
 
+The `core` module has no terminal dependencies — use it in scripts,
+pipelines, or other tools. All data is returned as plain dicts with a
+`_type` discriminator key.
+
 ```python
-from bandcamp_explorer.core import BandcampClient, AlbumAPI, ArtistAPI, DiscoverAPI, SearchAPI
+from bandcamp_explorer.core import (
+    BandcampClient, AlbumAPI, ArtistAPI, DiscoverAPI, SearchAPI,
+    resolve_location,
+)
 
 with BandcampClient() as client:
     # Search
@@ -95,14 +113,12 @@ with BandcampClient() as client:
         print(f"  {item['title']}")
 
     # Location filtering
-    from bandcamp_explorer.core import resolve_location
     tag_id = resolve_location(client, "paris")
     releases, _ = discover.discover(tags=["dungeon-synth", tag_id])
-```
 
-All data is returned as plain dicts with a `_type` discriminator key.
-The `core` module has no terminal dependencies — use it in scripts,
-pipelines, or other tools.
+    # Download images
+    client.download_image(album.get("image_url"), output_dir="./images/")
+```
 
 ## License
 

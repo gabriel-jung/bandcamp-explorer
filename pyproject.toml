@@ -1,40 +1,60 @@
+[build-system]
+requires = ["uv-build>=0.10.12,<0.12.0"]
+build-backend = "uv_build"
+
+
 [project]
 name = "bandcamp-explorer"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python library and CLI for Bandcamp data"
 readme = "README.md"
 authors = [
     { name = "Gabriel Jung", email = "gabriel.jung@protonmail.com" }
 ]
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
+keywords = ["bandcamp", "cli", "music", "tui", "terminal"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: End Users/Desktop",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Sound/Audio",
 ]
 dependencies = [
-    "beautifulsoup4",
-    "requests",
+    "beautifulsoup4>=4.12.0",
+    "requests>=2.32.0",
     "loguru>=0.7.3",
-    "rich>=14.0.0",
+    "rich-metadata>=0.1.1",
 ]
+
 
 [project.urls]
 Homepage = "https://github.com/gabriel-jung/bandcamp-explorer"
 Repository = "https://github.com/gabriel-jung/bandcamp-explorer"
+"Bug Tracker" = "https://github.com/gabriel-jung/bandcamp-explorer/issues"
+
 
 [project.scripts]
-bandcamp = "bandcamp_explorer.app.cli:main"
+bandcamp-explorer = "bandcamp_explorer.app.cli:main"
 
-[build-system]
-requires = ["uv-build>=0.10.12,<0.12.0"]
-build-backend = "uv_build"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 110
+
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["RUF022", "B904"]
+
 
 [dependency-groups]
 dev = [
     "pre-commit>=3.5.0",
+    "pytest>=8.0",
     "ruff>=0.15.7",
 ]

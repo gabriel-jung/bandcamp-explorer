@@ -63,12 +63,8 @@ class AlbumPageParser(BasePageParser):
         """
         publisher = data.get("publisher", {})
         # Track pages nest albumRelease inside inAlbum
-        releases = data.get("albumRelease") or (
-            data.get("inAlbum", {}).get("albumRelease")
-        )
-        release = (
-            (releases or [{}])[0] if isinstance(releases, list) else (releases or {})
-        )
+        releases = data.get("albumRelease") or (data.get("inAlbum", {}).get("albumRelease"))
+        release = (releases or [{}])[0] if isinstance(releases, list) else (releases or {})
         is_track = data.get("@type") == "MusicRecording"
 
         # Label from recordLabel (distinct from publisher/host)
@@ -91,9 +87,7 @@ class AlbumPageParser(BasePageParser):
         return {
             "_type": "album",
             "album_id": find_property(release.get("additionalProperty", []), "item_id"),
-            "artist_id": find_property(
-                publisher.get("additionalProperty", []), "band_id"
-            ),
+            "artist_id": find_property(publisher.get("additionalProperty", []), "band_id"),
             "artist_name": data.get("byArtist", {}).get("name"),
             "title": data.get("name"),
             "release_date": data.get("datePublished"),
@@ -121,10 +115,10 @@ class AlbumPageParser(BasePageParser):
             "DVDFormat": "DVD",
         }
         seen = []
-        for r in releases:
-            fmt = r.get("musicReleaseFormat")
-            if fmt and fmt in _FORMAT_MAP:
-                name = _FORMAT_MAP[fmt]
+        for release in releases:
+            format_type = release.get("musicReleaseFormat")
+            if format_type and format_type in _FORMAT_MAP:
+                name = _FORMAT_MAP[format_type]
                 if name not in seen:
                     seen.append(name)
         return seen
@@ -134,9 +128,7 @@ class AlbumPageParser(BasePageParser):
         publisher = data.get("publisher", {})
         return {
             "_type": "artist",
-            "artist_id": find_property(
-                publisher.get("additionalProperty", []), "band_id"
-            ),
+            "artist_id": find_property(publisher.get("additionalProperty", []), "band_id"),
             "name": publisher.get("name"),
             "url": publisher.get("@id"),
             "location": publisher.get("foundingLocation", {}).get("name"),
@@ -151,23 +143,17 @@ class AlbumPageParser(BasePageParser):
             duration_raw = track.get("duration")
             # Per-track artist (for compilations/VA)
             by_artist = track.get("byArtist")
-            track_artist = (
-                by_artist.get("name") if isinstance(by_artist, dict) else None
-            )
+            track_artist = by_artist.get("name") if isinstance(by_artist, dict) else None
 
             # Lyrics
             recording_of = track.get("recordingOf", {})
-            lyrics_obj = (
-                recording_of.get("lyrics", {}) if isinstance(recording_of, dict) else {}
-            )
+            lyrics_obj = recording_of.get("lyrics", {}) if isinstance(recording_of, dict) else {}
             lyrics = lyrics_obj.get("text") if isinstance(lyrics_obj, dict) else None
 
             tracks.append(
                 {
                     "_type": "track",
-                    "track_id": find_property(
-                        track.get("additionalProperty", []), "track_id"
-                    ),
+                    "track_id": find_property(track.get("additionalProperty", []), "track_id"),
                     "album_id": album_id,
                     "position": entry.get("position"),
                     "title": track.get("name"),
@@ -219,8 +205,8 @@ class ArtistPageParser(BasePageParser):
         image_url = img_el.get("src") if img_el else None
 
         # Extract artist_id from embedded page data
-        el = self.soup.find(attrs={"data-band-id": True})
-        band_id = el.get("data-band-id") if el else None
+        band_el = self.soup.find(attrs={"data-band-id": True})
+        band_id = band_el.get("data-band-id") if band_el else None
 
         # Label link ("more from Napalm Records" → label page)
         label_name = None
@@ -230,12 +216,12 @@ class ArtistPageParser(BasePageParser):
             label_url = label_link.get("href", "").split("?")[0]
             label_span = label_link.find("span", class_="back-link-text")
             if label_span:
-                raw = clean_text(label_span.get_text())
+                label_text = clean_text(label_span.get_text())
                 # Strip "more from" prefix
-                if "from" in raw.lower():
-                    label_name = raw.split("from", 1)[1].strip()
+                if "from" in label_text.lower():
+                    label_name = label_text.split("from", 1)[1].strip()
                 else:
-                    label_name = raw
+                    label_name = label_text
 
         return {
             "_type": "artist",
@@ -265,14 +251,14 @@ class ArtistPageParser(BasePageParser):
         items = []
 
         # Parse visible HTML grid items
-        for li in music_grid.find_all("li"):
-            link = li.find("a")
+        for grid_item in music_grid.find_all("li"):
+            link = grid_item.find("a")
             if not link:
                 continue
 
             title = ""
             artist_name = None
-            title_el = li.find("p", class_="title")
+            title_el = grid_item.find("p", class_="title")
             if title_el:
                 artist_span = title_el.find("span", class_="artist-override")
                 if artist_span:
@@ -280,11 +266,11 @@ class ArtistPageParser(BasePageParser):
                 title = clean_text(title_el.get_text())
 
             # Extract item type from data-item-id (e.g. "album-123")
-            data_item_id = li.get("data-item-id", "")
+            data_item_id = grid_item.get("data-item-id", "")
             item_type = data_item_id.split("-")[0] if "-" in data_item_id else None
 
-            art_el = li.find("img")
-            art_url_val = art_el.get("src") if art_el else None
+            art_el = grid_item.find("img")
+            artwork_url = art_el.get("src") if art_el else None
 
             href = link.get("href", "")
             if href.startswith("/"):
@@ -292,12 +278,12 @@ class ArtistPageParser(BasePageParser):
 
             items.append(
                 {
-                    "_type": "discography_item",
+                    "_type": "album",
                     "title": title,
                     "artist_name": artist_name,
                     "item_type": item_type,
                     "url": href,
-                    "art_url": art_url_val,
+                    "art_url": artwork_url,
                 }
             )
 
@@ -312,7 +298,7 @@ class ArtistPageParser(BasePageParser):
                         href = base_url + href
                     items.append(
                         {
-                            "_type": "discography_item",
+                            "_type": "album",
                             "title": entry.get("title", ""),
                             "artist_name": entry.get("artist"),
                             "item_type": entry.get("type"),
@@ -326,8 +312,8 @@ class ArtistPageParser(BasePageParser):
         return items
 
 
-# Maps Bandcamp search type codes to our type names
-_SEARCH_TYPE_MAP = {"b": "band", "a": "album", "t": "track", "f": "fan"}
+# Maps Bandcamp search type codes to entity types
+_SEARCH_TYPE_MAP = {"b": "artist", "a": "album", "t": "track"}
 
 
 class SearchPageParser(BasePageParser):
@@ -345,43 +331,44 @@ class SearchPageParser(BasePageParser):
     def _parse_results(self) -> list[dict]:
         """Extract all search result items from the page."""
         items = []
-        for li in self.soup.select("li.searchresult"):
-            result = self._parse_result(li)
+        for result_item in self.soup.select("li.searchresult"):
+            result = self._parse_result(result_item)
             if result:
                 items.append(result)
         return items
 
-    def _parse_result(self, li) -> dict | None:
+    def _parse_result(self, result_item) -> dict | None:
         """Parse a single search result ``<li>`` element."""
         # Type and ID from data-search attribute
-        data_search = li.get("data-search", "")
+        data_search = result_item.get("data-search", "")
         try:
             search_data = json.loads(data_search)
         except (json.JSONDecodeError, TypeError):
             return None
 
-        result_type = _SEARCH_TYPE_MAP.get(search_data.get("type"), "unknown")
-        result_id = search_data.get("id")
+        entity_type = _SEARCH_TYPE_MAP.get(search_data.get("type"))
+        if not entity_type:
+            return None
 
         # Name from .heading a
-        heading = li.select_one(".heading a")
+        heading = result_item.select_one(".heading a")
         name = clean_text(heading.get_text()) if heading else ""
 
         # Clean URL from .itemurl a (strips tracking params)
         url = ""
-        url_el = li.select_one(".itemurl a")
+        url_el = result_item.select_one(".itemurl a")
         if url_el:
             url = clean_text(url_el.get_text())
 
         # Subhead — location for bands, "by Artist" for albums/tracks
         subhead = ""
-        subhead_el = li.select_one(".subhead")
+        subhead_el = result_item.select_one(".subhead")
         if subhead_el:
             subhead = clean_text(subhead_el.get_text())
 
         # Genre
         genre = ""
-        genre_el = li.select_one(".genre")
+        genre_el = result_item.select_one(".genre")
         if genre_el:
             genre = clean_text(genre_el.get_text())
             # Strip "genre : " prefix (localized, uses &nbsp;)
@@ -390,36 +377,34 @@ class SearchPageParser(BasePageParser):
 
         # Tags
         tags = []
-        tags_el = li.select_one(".tags")
+        tags_el = result_item.select_one(".tags")
         if tags_el:
             tags_text = clean_text(tags_el.get_text())
             # Strip localized prefix like "catégories : " or "tags : "
             if ":" in tags_text:
                 tags_text = tags_text.split(":", 1)[1].strip()
-            tags = [t.strip() for t in tags_text.split(",") if t.strip()]
+            tags = [tag.strip() for tag in tags_text.split(",") if tag.strip()]
 
         # Image URL from .art img
-        img_el = li.select_one(".art img")
+        img_el = result_item.select_one(".art img")
         image_url = img_el.get("src") if img_el else None
 
-        # Build the result dict — fields vary by type
-        result = {
-            "_type": "search_result",
-            "result_type": result_type,
-            "result_id": result_id,
-            "name": name,
-            "url": url,
-            "genre": genre,
-            "tags": tags,
-            "image_url": image_url,
-        }
+        # Build result — normalize fields to match entity definitions
+        result = {"_type": entity_type, "url": url, "genre": genre, "tags": tags, "image_url": image_url}
 
-        # For bands: subhead is location
-        if result_type == "band":
+        if entity_type == "artist":
+            result["name"] = name
             result["location"] = subhead
-        else:
-            # For albums/tracks: subhead is "by Artist" or "from Album by Artist"
-            result["subhead"] = subhead
+        elif entity_type == "album":
+            result["title"] = name
+            result["artist_name"] = subhead[3:].strip() if subhead.lower().startswith("by ") else subhead
+        elif entity_type == "track":
+            result["title"] = name
+            # subhead is "from Album by Artist" or "by Artist"
+            if " by " in subhead:
+                result["artist"] = subhead.rsplit(" by ", 1)[1].strip()
+            elif subhead.lower().startswith("by "):
+                result["artist"] = subhead[3:].strip()
 
         return result
 

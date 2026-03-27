@@ -11,8 +11,11 @@ def find_property(prop_list: list[dict], name: str) -> str | None:
     Bandcamp stores IDs and metadata in JSON-LD as lists of
     {"name": ..., "value": ...} dicts.
     """
-    val = next((p["value"] for p in prop_list if p["name"] == name), None)
-    return str(val) if val is not None else None
+    value = next(
+        (prop["value"] for prop in prop_list if prop["name"] == name),
+        None,
+    )
+    return str(value) if value is not None else None
 
 
 def clean_text(text: str) -> str:
@@ -36,14 +39,6 @@ def format_track_time(raw: str | None) -> str | None:
     if parts is None:
         return None
     return format_duration(parts[0] * 3600 + parts[1] * 60 + parts[2])
-
-
-def track_time_to_seconds(raw: str | None) -> int:
-    """Convert Bandcamp track duration to total seconds. Returns 0 on failure."""
-    parts = _parse_track_time(raw)
-    if parts is None:
-        return 0
-    return parts[0] * 3600 + parts[1] * 60 + parts[2]
 
 
 def format_duration(total_seconds: int) -> str:
@@ -76,8 +71,5 @@ def parse_tags(raw_tags) -> list[str]:
     """
     if not raw_tags:
         return []
-    if isinstance(raw_tags, str):
-        tags = [t.strip() for t in raw_tags.split(",")]
-    else:
-        tags = list(raw_tags)
-    return [t.lower().strip() for t in tags if t.strip()]
+    tags = [tag.strip() for tag in raw_tags.split(",")] if isinstance(raw_tags, str) else list(raw_tags)
+    return [tag.lower().strip() for tag in tags if tag.strip()]

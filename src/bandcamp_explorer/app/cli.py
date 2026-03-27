@@ -9,35 +9,257 @@ Usage::
     bandcamp https://erang.bandcamp.com/album/tome-iv
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import sys
+from datetime import datetime
+from importlib.metadata import version
 
-from loguru import logger
+__version__ = version("bandcamp-explorer")
 
-from .. import __version__
+from rich.panel import Panel
+from rich_metadata import (
+    BaseNavigator,
+    DisplayEngine,
+    EntityDef,
+    HeaderField,
+    HeaderLink,
+    QuitSignal,
+    SectionDef,
+    SummaryField,
+    TableColumn,
+    configure_logging,
+    page_fetcher,
+)
+
 from ..core.api import AlbumAPI, ArtistAPI, DiscoverAPI, SearchAPI
 from ..core.client import BandcampClient
 from ..core.countries import resolve_location
-from .display import console
-from .navigator import Navigator
+
+# ─── Display transforms ──────────────────────────────────────────────────────
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _format_date(raw):
+    """Format '03 Mar 2026 00:00:00 GMT' → '03 Mar 2026'."""
+    if not raw:
+        return ""
+    try:
+        dt = datetime.strptime(raw, "%d %b %Y %H:%M:%S %Z")
+        return dt.strftime("%d %b %Y")
+    except ValueError:
+        return raw
+
+
+def _release_type(raw):
+    """Strip 'Release' suffix from album release types."""
+    if not raw:
+        return ""
+    return raw.replace("Release", "").strip()
+
+
+def _album_host(entity):
+    """Show host name only if different from byArtist name."""
+    host = entity.get("artist", {}).get("name", "")
+    artist = entity.get("artist_name", "")
+    return host if host and host != artist else ""
+
+
+def _render_lyrics(console, entity):
+    """Custom section renderer for album lyrics."""
+    tracks = entity.get("_lyrics", [])
+    if not tracks:
+        console.print("\n[dim]No lyrics available.[/dim]")
+        return
+    console.print(f"\n[dim]{len(tracks)} track(s) with lyrics[/dim]")
+    for track in tracks:
+        title = track.get("title", "")
+        artist = track.get("artist")
+        header = f"{title} — {artist}" if artist else title
+        console.print()
+        console.print(
+            Panel(
+                track["lyrics"].strip(),
+                title=header,
+                border_style="dim",
+                width=min(80, console.width),
+            )
+        )
+
+
+def _prepare_album(album):
+    """Precompute derived fields on an album entity."""
+    host = album.get("artist", {}).get("name", "")
+    artist = album.get("artist_name", "")
+    album["_host_label"] = f"Host: {host}" if host and host != artist else f"Artist: {artist}"
+    lyrics = [track for track in album.get("tracks", []) if track.get("lyrics")]
+    if lyrics:
+        album["_lyrics"] = lyrics
+
+
+# ─── Entity definitions ──────────────────────────────────────────────────────
+
+track_def = EntityDef(
+    type_name="track",
+    summary=[
+        SummaryField(key="title", style="bold"),
+        SummaryField(key="artist", style="dim"),
+        SummaryField(key="duration", style="dim"),
+    ],
+)
+
+album_def = EntityDef(
+    type_name="album",
+    summary=[
+        SummaryField(key="artist_name", style="bold"),
+        SummaryField(key="title", prefix="- "),
+        SummaryField(
+            transform=lambda d: ", ".join(d.get("tags", [])[:3]),
+            style="dim",
+        ),
+    ],
+    header_title=lambda d: f"[bold]{d.get('title', '')}[/bold]",
+    header_image_key="_art_data",
+    header_fields=[
+        HeaderField("Artist", key="artist_name"),
+        HeaderField("Host", transform=_album_host),
+        HeaderField("Label", key="label"),
+        HeaderField("Date", key="release_date", transform=_format_date),
+        HeaderField("Type", key="release_type", transform=_release_type),
+        HeaderField(
+            "Formats",
+            transform=lambda d: ", ".join(d.get("formats", [])),
+        ),
+        HeaderField("Catalog", key="catalog"),
+        HeaderField("Tags", transform=lambda d: ", ".join(d.get("tags", []))),
+        HeaderField(
+            "Location",
+            transform=lambda d: d.get("artist", {}).get("location", ""),
+        ),
+        HeaderField("URL", key="url"),
+        HeaderField(
+            "Supporters",
+            transform=lambda d: str(d["num_supporters"]) if d.get("num_supporters") else "",
+        ),
+    ],
+    sections=[
+        SectionDef(
+            "tracks",
+            label="Tracklist",
+            navigable=True,
+            numbered=False,
+            duration_key="duration",
+            columns=[
+                TableColumn(
+                    "#",
+                    "position",
+                    justify="right",
+                    style="dim",
+                    width=4,
+                ),
+                TableColumn("Title", "title"),
+                TableColumn("Artist", "artist", style="dim"),
+                TableColumn(
+                    "Duration",
+                    "duration",
+                    justify="right",
+                    style="dim",
+                ),
+            ],
+        ),
+        SectionDef("description"),
+        SectionDef("_lyrics", label="Lyrics", custom_render=_render_lyrics),
+    ],
+    header_links=[
+        HeaderLink(
+            "{_host_label}",
+            "artist",
+            ref_fn=lambda d: d.get("artist", {}).get("url"),
+        ),
+    ],
+    footer=["image_url"],
+)
+
+artist_def = EntityDef(
+    type_name="artist",
+    summary=[
+        SummaryField(key="name", style="bold"),
+        SummaryField(key="location", style="dim"),
+    ],
+    header_image_key="_art_data",
+    header_fields=[
+        HeaderField("Location", key="location"),
+        HeaderField("Label", key="label"),
+        HeaderField("URL", key="url"),
+    ],
+    sections=[
+        SectionDef("bio", label="Bio"),
+        SectionDef(
+            "discography",
+            navigable=True,
+            columns=[
+                TableColumn("Title", "title", style="bold"),
+                TableColumn("Artist", "artist_name", style="dim"),
+            ],
+        ),
+    ],
+    header_links=[
+        HeaderLink("Label: {label}", "artist", ref_key="label_url"),
+    ],
+    footer=["image_url"],
+)
+
+engine = DisplayEngine()
+engine.register(track_def, album_def, artist_def)
+console = engine.console
+
+
+# ─── Engine & navigator setup ────────────────────────────────────────────────
+
+
+class _AlbumFetcher:
+    """Wraps AlbumAPI to apply display transforms after fetching."""
+
+    def __init__(self, client: BandcampClient):
+        self._api = AlbumAPI(client)
+
+    def get(self, ref, **kwargs):
+        entity = self._api.get(ref, **kwargs)
+        if entity:
+            _prepare_album(entity)
+        return entity
+
+
+def _make_navigator(client: BandcampClient) -> BaseNavigator:
+    """Create a navigator wired to all Bandcamp APIs."""
+    album_fetcher = _AlbumFetcher(client)
+    apis = {
+        "album": album_fetcher,
+        "track": album_fetcher,
+        "artist": ArtistAPI(client),
+        "search": SearchAPI(client),
+        "discover": DiscoverAPI(client),
+    }
+    return BaseNavigator(engine, apis=apis, entity_ref_key="url")
+
+
+# ─── Parser ──────────────────────────────────────────────────────────────────
+
+
+def _build_parser():
     """Build the argument parser with all modes and options."""
     parser = argparse.ArgumentParser(
         prog="bandcamp",
         description="Browse and fetch Bandcamp data.",
     )
 
-    # Primary: text search
     parser.add_argument(
         "query",
         nargs="*",
         help="Search query (e.g. 'dungeon synth')",
     )
 
-    # Secondary: tag-based browse
     parser.add_argument(
         "--tag",
         nargs="+",
@@ -45,7 +267,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Browse releases by tag(s) (e.g. dungeon-synth black-metal)",
     )
 
-    # Search type filters
     parser.add_argument(
         "--artist",
         action="store_true",
@@ -62,7 +283,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Search tracks only",
     )
 
-    # Tag browse filters
     parser.add_argument(
         "--sort",
         choices=["date", "pop"],
@@ -72,7 +292,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--location",
         type=str,
-        help="Filter by location (e.g. france, paris, california, europe)",
+        help="Filter by location",
     )
     parser.add_argument(
         "--refresh-location",
@@ -80,11 +300,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Force re-fetch of location tag_id (bypass cache)",
     )
 
-    # Output modes
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument(
-        "--json",
+        "--full",
         action="store_true",
-        help="Output as JSON",
+        help="Non-interactive: show header and all sections, then exit",
     )
     parser.add_argument(
         "-v",
@@ -92,7 +312,6 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Debug logging",
     )
-
     parser.add_argument(
         "--version",
         action="version",
@@ -102,7 +321,10 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_item_type(args) -> str:
+# ─── Search/browse commands ──────────────────────────────────────────────────
+
+
+def _resolve_item_type(args):
     """Determine the item_type filter from --artist, --album, --track flags."""
     if args.artist:
         return "band"
@@ -113,43 +335,35 @@ def _resolve_item_type(args) -> str:
     return "all"
 
 
-def _is_bandcamp_url(text: str) -> bool:
+def _is_bandcamp_url(text):
     """Check if text looks like a Bandcamp URL."""
     return "bandcamp.com" in text
 
 
-def _run_url(nav: Navigator, args) -> None:
+def _run_url(nav, args):
     """Fetch and display a Bandcamp URL directly."""
     url = " ".join(args.query)
-
-    if "/album/" in url or "/track/" in url:
-        with console.status("Fetching album..."):
-            entity = AlbumAPI(nav.client).get(url)
-    else:
-        with console.status("Fetching artist..."):
-            entity = ArtistAPI(nav.client).get(url)
+    entity_type = "album" if "/album/" in url or "/track/" in url else "artist"
+    entity = nav.fetch_entity(entity_type, url)
 
     if not entity:
         console.print("[red]Failed to fetch page.[/red]")
         return
 
-    if args.json:
-        nav._show_detail(entity)
-        return
-
-    nav.navigate_entity(entity, top_level=True)
+    nav.display_or_navigate(entity, json_output=args.json, full=args.full)
 
 
-def _run_search(nav: Navigator, args) -> None:
+def _run_search(nav, args):
     """Text search with paginated results."""
-    api = SearchAPI(nav.client)
+    search = nav.apis["search"]
     query = " ".join(args.query)
     item_type = _resolve_item_type(args)
 
-    current_page = 1
     with console.status("Searching..."):
-        results, has_more = api.search(
-            query=query, page=current_page, item_type=item_type
+        results, has_more = search.search(
+            query=query,
+            page=1,
+            item_type=item_type,
         )
 
     if not results:
@@ -158,35 +372,48 @@ def _run_search(nav: Navigator, args) -> None:
 
     if args.json:
         all_results = list(results)
+        page = 1
         while has_more:
-            current_page += 1
-            more, has_more = api.search(
-                query=query, page=current_page, item_type=item_type
+            page += 1
+            more, has_more = search.search(
+                query=query,
+                page=page,
+                item_type=item_type,
             )
             all_results.extend(more)
         print(json.dumps(all_results, indent=2, ensure_ascii=False))
         return
 
-    nav.paginate(
-        results,
-        has_more,
-        current_page,
-        fetch_page=lambda p: api.search(query=query, page=p, item_type=item_type),
-        summary_key="search_result",
+    if args.full:
+        entity = nav.fetch_entity(results[0]["_type"], results[0].get("url"))
+        if entity:
+            engine.details(entity)
+        return
+
+    nav.browse(
+        fetch_page=page_fetcher(
+            lambda p: search.search(query=query, page=p, item_type=item_type),
+            first_page=(results, has_more),
+        ),
         title=f'Search: "{query}"',
+        page_size=len(results),
     )
 
 
-def _run_tag_browse(nav: Navigator, args) -> None:
+def _run_tag_browse(nav, client, args):
     """Browse releases by tag with paginated results."""
-    api = DiscoverAPI(nav.client)
+    discover = nav.apis["discover"]
 
-    tags = [t.replace(" ", "-") for t in args.tag]
+    tags = [tag.replace(" ", "-") for tag in args.tag]
     location_used = False
     if args.location:
-        with console.status(f"Looking up location [bold]{args.location}[/bold]..."):
+        with console.status(
+            f"Looking up location [bold]{args.location}[/bold]...",
+        ):
             tag_id = resolve_location(
-                nav.client, args.location, force=args.refresh_location
+                client,
+                args.location,
+                force=args.refresh_location,
             )
         if tag_id is None:
             console.print(f"[red]Unknown location: {args.location}[/red]")
@@ -194,19 +421,23 @@ def _run_tag_browse(nav: Navigator, args) -> None:
         tags.append(tag_id)
         location_used = True
 
-    current_page = 1
     with console.status("Searching..."):
-        results, has_more = api.discover(tags=tags, sort=args.sort, page=current_page)
+        results, has_more = discover.discover(
+            tags=tags,
+            sort=args.sort,
+            page=1,
+        )
 
     if not results and location_used:
-        logger.info("No results with location tag, refreshing...")
         with console.status("Refreshing location tag..."):
-            tag_id = resolve_location(nav.client, args.location, force=True)
+            tag_id = resolve_location(client, args.location, force=True)
         if tag_id is not None:
-            tags = list(args.tag) + [tag_id]
+            tags = [tag.replace(" ", "-") for tag in args.tag] + [tag_id]
             with console.status("Searching..."):
-                results, has_more = api.discover(
-                    tags=tags, sort=args.sort, page=current_page
+                results, has_more = discover.discover(
+                    tags=tags,
+                    sort=args.sort,
+                    page=1,
                 )
 
     if not results:
@@ -215,22 +446,38 @@ def _run_tag_browse(nav: Navigator, args) -> None:
 
     if args.json:
         all_results = list(results)
+        page = 1
         while has_more:
-            current_page += 1
-            more, has_more = api.discover(tags=tags, sort=args.sort, page=current_page)
+            page += 1
+            more, has_more = discover.discover(
+                tags=tags,
+                sort=args.sort,
+                page=page,
+            )
             all_results.extend(more)
         print(json.dumps(all_results, indent=2, ensure_ascii=False))
         return
 
-    tag_label = " + ".join(str(t) for t in args.tag)
-    nav.paginate(
-        results,
-        has_more,
-        current_page,
-        fetch_page=lambda p: api.discover(tags=tags, sort=args.sort, page=p),
-        summary_key="release_summary",
+    if args.full:
+        url = results[0].get("url")
+        if url:
+            entity = nav.fetch_entity("album", url)
+            if entity:
+                engine.details(entity)
+        return
+
+    tag_label = " + ".join(str(tag) for tag in args.tag)
+    nav.browse(
+        fetch_page=page_fetcher(
+            lambda p: discover.discover(tags=tags, sort=args.sort, page=p),
+            first_page=(results, has_more),
+        ),
         title=f"Tag: {tag_label}",
+        page_size=len(results),
     )
+
+
+# ─── Main ────────────────────────────────────────────────────────────────────
 
 
 def main():
@@ -238,13 +485,7 @@ def main():
     parser = _build_parser()
     args = parser.parse_args()
 
-    logger.remove()
-    level = "DEBUG" if args.verbose else "WARNING"
-    logger.add(
-        sys.stderr,
-        level=level,
-        format="<dim>{time:HH:mm:ss}</dim> | <level>{level: <8}</level> | {message}",
-    )
+    configure_logging(args.verbose)
 
     has_query = bool(args.query)
     has_tag = bool(args.tag)
@@ -253,13 +494,13 @@ def main():
         parser.error("provide a search query or use --tag for tag browsing")
 
     with BandcampClient() as client:
-        nav = Navigator(client, args)
+        nav = _make_navigator(client)
         try:
             if has_tag:
-                _run_tag_browse(nav, args)
+                _run_tag_browse(nav, client, args)
             elif has_query and _is_bandcamp_url(" ".join(args.query)):
                 _run_url(nav, args)
             else:
                 _run_search(nav, args)
-        except KeyboardInterrupt:
+        except (QuitSignal, KeyboardInterrupt):
             pass
