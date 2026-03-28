@@ -107,6 +107,17 @@ track_def = EntityDef(
         SummaryField(key="artist", style="dim"),
         SummaryField(key="duration", style="dim"),
     ],
+    header_title=lambda d: f"[bold]{d.get('title', '')}[/bold]",
+    header_fields=[
+        HeaderField("Artist", key="artist"),
+        HeaderField("Duration", key="duration"),
+        HeaderField("Track", key="position", transform=lambda v: str(v) if v else ""),
+    ],
+    sections=[
+        SectionDef("lyrics"),
+    ],
+    footer=["track_url"],
+    auto_full=True,
 )
 
 album_def = EntityDef(
@@ -236,7 +247,6 @@ def _make_navigator(client: BandcampClient) -> BaseNavigator:
     album_fetcher = _AlbumFetcher(client)
     apis = {
         "album": album_fetcher,
-        "track": album_fetcher,
         "artist": ArtistAPI(client),
         "search": SearchAPI(client),
         "discover": DiscoverAPI(client),

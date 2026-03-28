@@ -4,7 +4,7 @@ requires-python = ">=3.12"
 
 [[package]]
 name = "bandcamp-explorer"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -25,7 +25,7 @@ requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12.0" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "requests", specifier = ">=2.32.0" },
-    { name = "rich-metadata", specifier = ">=0.1.1" },
+    { name = "rich-metadata", specifier = ">=0.1.2" },
 ]
 
 [package.metadata.requires-dev]
@@ -393,15 +393,15 @@ wheels = [
 
 [[package]]
 name = "rich-metadata"
-version = "0.1.1"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "loguru" },
     { name = "rich" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/20/bb/b125ba1e0d4703ca1516281587c6bc1aee7d3709a9a721da5ebc5e36f89d/rich_metadata-0.1.1.tar.gz", hash = "sha256:36f153a079eeb9b6fa2e714004aa720970e53bc81a0d886887fa0d24437b8292", size = 16712, upload-time = "2026-03-27T17:06:28.871Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1a/a2/f4145ecb7666217e28465a0115bbbe1326cc9c4071670ea212f9575c9424/rich_metadata-0.1.2.tar.gz", hash = "sha256:13f176c6a979cb751f6e5e596d98401a335c3bdff99f5b08d4c71a91a87bb970", size = 17300, upload-time = "2026-03-28T15:45:46.445Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/10/60/b9ef58d09f24e31d12c8d9d45eb60f21b31bfdcfd0c0421b6b85183d9ff4/rich_metadata-0.1.1-py3-none-any.whl", hash = "sha256:015f4214288768d06d3661c2486f51b09e6b8865c697d4d47c1b1a41eb5c5c48", size = 20027, upload-time = "2026-03-27T17:06:27.722Z" },
+    { url = "https://files.pythonhosted.org/packages/3a/4b/e2e36de7dc23d844c344100c5f714e54d464df53f7d23a704b0955352b36/rich_metadata-0.1.2-py3-none-any.whl", hash = "sha256:cf1bdd3d0ed61a53b3fa2b97f1e130a9fb86d172e933587151c77150955c4722", size = 20652, upload-time = "2026-03-28T15:45:45.253Z" },
 ]
 
 [[package]]

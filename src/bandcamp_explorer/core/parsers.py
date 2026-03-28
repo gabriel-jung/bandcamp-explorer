@@ -157,7 +157,7 @@ class AlbumPageParser(BasePageParser):
                     "album_id": album_id,
                     "position": entry.get("position"),
                     "title": track.get("name"),
-                    "url": track.get("@id"),
+                    "track_url": track.get("@id"),
                     "artist": track_artist,
                     "duration": format_track_time(duration_raw),
                     "duration_raw": duration_raw,
