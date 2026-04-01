@@ -9,13 +9,49 @@ browse artist/label profiles and discographies — all from the command line.
 
 Requires Python 3.12+.
 
+### Terminal CLI
+
 ```bash
 uv tool install bandcamp-explorer
 # or
 pip install bandcamp-explorer
 ```
 
-For local development:
+### Discord bot
+
+```bash
+uv tool install bandcamp-explorer[discord]
+# or
+pip install bandcamp-explorer[discord]
+```
+
+Create a bot application at the [Discord Developer Portal](https://discord.com/developers/applications),
+enable the `bot` scope with `Send Messages` and `Use Slash Commands` permissions,
+then invite it to your server with the generated OAuth2 URL.
+
+Set your bot token and run:
+
+```bash
+export DISCORD_TOKEN=your-bot-token
+bandcamp-discord
+# or with a .env file in the current directory
+bandcamp-discord
+```
+
+Use `--guild GUILD_ID` to sync slash commands instantly to a specific server
+(global sync can take up to an hour).
+
+Slash commands (all under `/bandcamp`):
+
+| Command | Description |
+|---------|-------------|
+| `/bandcamp search <query>` | Search everything |
+| `/bandcamp album <query>` | Search albums |
+| `/bandcamp artist <query>` | Search artists/labels |
+| `/bandcamp track <query>` | Search tracks |
+| `/bandcamp discover <tag>` | Browse releases by tag (with optional sort and location filters) |
+
+### Development
 
 ```bash
 git clone https://github.com/gabriel-jung/bandcamp-explorer.git

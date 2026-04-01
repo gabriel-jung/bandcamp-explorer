@@ -32,6 +32,7 @@ from rich_metadata import (
     TableColumn,
     configure_logging,
     page_fetcher,
+    strip_internal_keys,
 )
 
 from ..core.api import AlbumAPI, ArtistAPI, DiscoverAPI, SearchAPI
@@ -391,7 +392,7 @@ def _run_search(nav, args):
                 item_type=item_type,
             )
             all_results.extend(more)
-        print(json.dumps(all_results, indent=2, ensure_ascii=False))
+        print(json.dumps(strip_internal_keys(all_results), indent=2, ensure_ascii=False))
         return
 
     if args.full:
@@ -407,6 +408,7 @@ def _run_search(nav, args):
         ),
         title=f'Search: "{query}"',
         page_size=len(results),
+        loop=True,
     )
 
 
@@ -465,7 +467,7 @@ def _run_tag_browse(nav, client, args):
                 page=page,
             )
             all_results.extend(more)
-        print(json.dumps(all_results, indent=2, ensure_ascii=False))
+        print(json.dumps(strip_internal_keys(all_results), indent=2, ensure_ascii=False))
         return
 
     if args.full:
@@ -484,6 +486,7 @@ def _run_tag_browse(nav, client, args):
         ),
         title=f"Tag: {tag_label}",
         page_size=len(results),
+        loop=True,
     )
 
 

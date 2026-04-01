@@ -5,7 +5,7 @@ build-backend = "uv_build"
 
 [project]
 name = "bandcamp-explorer"
-version = "0.3.1"
+version = "0.4.0"
 description = "Python library and CLI for Bandcamp data"
 readme = "README.md"
 authors = [
@@ -26,7 +26,7 @@ classifiers = [
 ]
 dependencies = [
     "beautifulsoup4>=4.12.0",
-    "requests>=2.32.0",
+    "curl-cffi>=0.7.0",
     "loguru>=0.7.3",
     "rich-metadata>=0.1.2",
 ]
@@ -38,8 +38,17 @@ Repository = "https://github.com/gabriel-jung/bandcamp-explorer"
 "Bug Tracker" = "https://github.com/gabriel-jung/bandcamp-explorer/issues"
 
 
+[project.optional-dependencies]
+discord = [
+    "discord.py>=2.7.0",
+    "discord-metadata>=0.1.0",
+    "python-dotenv>=1.0.0",
+]
+
+
 [project.scripts]
-bandcamp-explorer = "bandcamp_explorer.app.cli:main"
+bandcamp = "bandcamp_explorer.app.cli:main"
+bandcamp-discord = "bandcamp_explorer.app.discord:main"
 
 
 [tool.ruff]
@@ -57,4 +66,10 @@ dev = [
     "pre-commit>=3.5.0",
     "pytest>=8.0",
     "ruff>=0.15.7",
+    { include-group = "discord" },
+]
+discord = [
+    "discord.py>=2.7.0",
+    "discord-metadata>=0.1.0",
+    "python-dotenv>=1.0.0",
 ]
