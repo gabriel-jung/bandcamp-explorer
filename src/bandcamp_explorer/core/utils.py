@@ -2,7 +2,7 @@
 
 import re
 
-_TRACK_TIME_RE = re.compile(r"P(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
+_TRACK_TIME_RE = re.compile(r"^P(?=\d)(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$")
 
 
 def find_property(prop_list: list[dict], name: str) -> str | None:

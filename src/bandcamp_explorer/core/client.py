@@ -7,6 +7,7 @@ from curl_cffi import requests as curl_requests
 from loguru import logger
 
 REQUEST_TIMEOUT = 15
+_HTTP_EXCEPTIONS = curl_requests.exceptions.RequestException
 
 
 class NotFoundError(Exception):
@@ -38,9 +39,7 @@ class BandcampClient:
                 raise NotFoundError(url)
             response.raise_for_status()
             return response.text
-        except NotFoundError:
-            raise
-        except Exception as e:
+        except _HTTP_EXCEPTIONS as e:
             logger.error(f"GET failed for {url}: {e}")
             return None
 
@@ -51,7 +50,7 @@ class BandcampClient:
             response = self._session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             return response.json()
-        except Exception as e:
+        except _HTTP_EXCEPTIONS as e:
             logger.error(f"POST failed for {url}: {e}")
             return None
 
@@ -62,12 +61,16 @@ class BandcampClient:
             response = self._session.get(url, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             return response.content
-        except Exception as e:
+        except _HTTP_EXCEPTIONS as e:
             logger.error(f"GET bytes failed for {url}: {e}")
             return None
 
     def download_image(self, url: str, output_dir: str = "./images/") -> str | None:
-        """Download an image to a local file, return saved path or None."""
+        """Download an image to a local file, return saved path or None.
+
+        Used by the sibling ``bandcamp-explorer-data`` project for bulk
+        image harvesting.
+        """
         if not url:
             return None
 
@@ -84,8 +87,8 @@ class BandcampClient:
             logger.debug(f"Downloaded {filename} -> {output_path}")
             return str(output_path)
 
-        except Exception as e:
-            logger.debug(f"Failed to download {url}: {e}")
+        except OSError as e:
+            logger.debug(f"Failed to save {url}: {e}")
             return None
 
     def _wait_between_requests(self, crawl: bool = False):

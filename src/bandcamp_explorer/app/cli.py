@@ -14,10 +14,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime
-from importlib.metadata import version
-
-__version__ = version("bandcamp-explorer")
 
 from rich.panel import Panel
 from rich_metadata import (
@@ -35,36 +31,18 @@ from rich_metadata import (
     strip_internal_keys,
 )
 
-from ..core.api import AlbumAPI, ArtistAPI, DiscoverAPI, SearchAPI
+from .. import __version__
+from ..core.api import AlbumAPI, ArtistAPI, DiscoverWebAPI, SearchAPI
 from ..core.client import BandcampClient
-from ..core.countries import resolve_location
-
-# ─── Display transforms ──────────────────────────────────────────────────────
-
-
-def _format_date(raw):
-    """Format '03 Mar 2026 00:00:00 GMT' → '03 Mar 2026'."""
-    if not raw:
-        return ""
-    try:
-        dt = datetime.strptime(raw, "%d %b %Y %H:%M:%S %Z")
-        return dt.strftime("%d %b %Y")
-    except ValueError:
-        return raw
-
-
-def _release_type(raw):
-    """Strip 'Release' suffix from album release types."""
-    if not raw:
-        return ""
-    return raw.replace("Release", "").strip()
-
-
-def _album_host(entity):
-    """Show host name only if different from byArtist name."""
-    host = entity.get("artist", {}).get("name", "")
-    artist = entity.get("artist_name", "")
-    return host if host and host != artist else ""
+from ..core.countries import resolve_geoname
+from ..core.format import (
+    album_host,
+    album_summary_extras,
+    album_title_with_duration,
+    format_date,
+    prepare_album,
+    release_type,
+)
 
 
 def _render_lyrics(console, entity):
@@ -87,16 +65,6 @@ def _render_lyrics(console, entity):
                 width=min(80, console.width),
             )
         )
-
-
-def _prepare_album(album):
-    """Precompute derived fields on an album entity."""
-    host = album.get("artist", {}).get("name", "")
-    artist = album.get("artist_name", "")
-    album["_host_label"] = f"Host: {host}" if host and host != artist else f"Artist: {artist}"
-    lyrics = [track for track in album.get("tracks", []) if track.get("lyrics")]
-    if lyrics:
-        album["_lyrics"] = lyrics
 
 
 # ─── Entity definitions ──────────────────────────────────────────────────────
@@ -125,20 +93,21 @@ album_def = EntityDef(
     type_name="album",
     summary=[
         SummaryField(key="artist_name", style="bold"),
-        SummaryField(key="title", prefix="- "),
+        SummaryField(transform=lambda d: album_title_with_duration(d, prefix="- ")),
         SummaryField(
             transform=lambda d: ", ".join(d.get("tags", [])[:3]),
             style="dim",
         ),
+        SummaryField(transform=album_summary_extras, style="dim"),
     ],
     header_title=lambda d: f"[bold]{d.get('title', '')}[/bold]",
     header_image_key="_art_data",
     header_fields=[
         HeaderField("Artist", key="artist_name"),
-        HeaderField("Host", transform=_album_host),
+        HeaderField("Host", transform=album_host),
         HeaderField("Label", key="label"),
-        HeaderField("Date", key="release_date", transform=_format_date),
-        HeaderField("Type", key="release_type", transform=_release_type),
+        HeaderField("Date", key="release_date", transform=format_date),
+        HeaderField("Type", key="release_type", transform=release_type),
         HeaderField(
             "Formats",
             transform=lambda d: ", ".join(d.get("formats", [])),
@@ -239,7 +208,7 @@ class _AlbumFetcher:
     def get(self, ref, **kwargs):
         entity = self._api.get(ref, **kwargs)
         if entity:
-            _prepare_album(entity)
+            prepare_album(entity)
         return entity
 
 
@@ -250,7 +219,7 @@ def _make_navigator(client: BandcampClient) -> BaseNavigator:
         "album": album_fetcher,
         "artist": ArtistAPI(client),
         "search": SearchAPI(client),
-        "discover": DiscoverAPI(client),
+        "discover": DiscoverWebAPI(client),
     }
     return BaseNavigator(engine, apis=apis, entity_ref_key="url")
 
@@ -295,15 +264,9 @@ def _build_parser():
     )
 
     parser.add_argument(
-        "--sort",
-        choices=["date", "pop"],
-        default="date",
-        help="Sort mode for tag browse (default: date)",
-    )
-    parser.add_argument(
         "--location",
         type=str,
-        help="Filter by location",
+        help="Filter --tag browse by location (resolved via Bandcamp geoname search)",
     )
     parser.add_argument(
         "--refresh-location",
@@ -311,7 +274,36 @@ def _build_parser():
         help="Force re-fetch of location tag_id (bypass cache)",
     )
 
+    slice_group = parser.add_mutually_exclusive_group()
+    slice_group.add_argument(
+        "--new",
+        dest="slice",
+        action="store_const",
+        const="new",
+        help="--tag: newest arrivals (default)",
+    )
+    slice_group.add_argument(
+        "--top",
+        dest="slice",
+        action="store_const",
+        const="top",
+        help="--tag: best-selling",
+    )
+    slice_group.add_argument(
+        "--rand",
+        dest="slice",
+        action="store_const",
+        const="rand",
+        help="--tag: surprise me",
+    )
+
     parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Cap results for --tag --json (default: unlimited)",
+    )
     parser.add_argument(
         "--full",
         action="store_true",
@@ -413,79 +405,59 @@ def _run_search(nav, args):
 
 
 def _run_tag_browse(nav, client, args):
-    """Browse releases by tag with paginated results."""
-    discover = nav.apis["discover"]
-
+    """Browse releases via the discover_web endpoint (cursor-based)."""
+    api: DiscoverWebAPI = nav.apis["discover"]
     tags = [tag.replace(" ", "-") for tag in args.tag]
-    location_used = False
+    slice_ = args.slice or "new"
+
+    geoname_id = 0
     if args.location:
-        with console.status(
-            f"Looking up location [bold]{args.location}[/bold]...",
-        ):
-            tag_id = resolve_location(
-                client,
-                args.location,
-                force=args.refresh_location,
-            )
-        if tag_id is None:
+        with console.status(f"Looking up location [bold]{args.location}[/bold]..."):
+            geoname_id = resolve_geoname(client, args.location, force=args.refresh_location) or 0
+        if not geoname_id:
             console.print(f"[red]Unknown location: {args.location}[/red]")
             sys.exit(1)
-        tags.append(tag_id)
-        location_used = True
+
+    # --json dumps in one pass; larger batches → far fewer round-trips.
+    batch_size = 200 if args.json else 40
+    fetch_page = api.make_page_fetcher(tags=tags, slice_=slice_, geoname_id=geoname_id, batch_size=batch_size)
 
     with console.status("Searching..."):
-        results, has_more = discover.discover(
-            tags=tags,
-            sort=args.sort,
-            page=1,
-        )
+        first_items, _ = fetch_page(0, batch_size)
 
-    if not results and location_used:
-        with console.status("Refreshing location tag..."):
-            tag_id = resolve_location(client, args.location, force=True)
-        if tag_id is not None:
-            tags = [tag.replace(" ", "-") for tag in args.tag] + [tag_id]
-            with console.status("Searching..."):
-                results, has_more = discover.discover(
-                    tags=tags,
-                    sort=args.sort,
-                    page=1,
-                )
-
-    if not results:
+    if not first_items:
         console.print("[dim]No releases found.[/dim]")
         return
 
     if args.json:
-        all_results = list(results)
-        page = 1
-        while has_more:
-            page += 1
-            more, has_more = discover.discover(
-                tags=tags,
-                sort=args.sort,
-                page=page,
-            )
-            all_results.extend(more)
-        print(json.dumps(strip_internal_keys(all_results), indent=2, ensure_ascii=False))
+        cap = args.limit
+        items: list[dict] = list(first_items)
+        while cap is None or len(items) < cap:
+            want = batch_size if cap is None else min(batch_size, cap - len(items))
+            next_batch, total = fetch_page(len(items), want)
+            if not next_batch:
+                break
+            items.extend(next_batch)
+            if len(items) >= total:
+                break
+        if cap:
+            items = items[:cap]
+        print(json.dumps(strip_internal_keys(items), indent=2, ensure_ascii=False))
         return
 
     if args.full:
-        url = results[0].get("url")
+        url = first_items[0].get("url")
         if url:
             entity = nav.fetch_entity("album", url)
             if entity:
                 engine.details(entity)
         return
 
-    tag_label = " + ".join(str(tag) for tag in args.tag)
+    tag_label = " + ".join(tags)
     nav.browse(
-        fetch_page=page_fetcher(
-            lambda p: discover.discover(tags=tags, sort=args.sort, page=p),
-            first_page=(results, has_more),
-        ),
-        title=f"Tag: {tag_label}",
-        page_size=len(results),
+        fetch_page=fetch_page,
+        title=f"Tag: {tag_label} [{slice_}]",
+        page_size=40,
         loop=True,
     )
 

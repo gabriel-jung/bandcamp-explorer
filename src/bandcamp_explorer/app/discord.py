@@ -7,62 +7,54 @@ Run with the ``bandcamp-discord`` entry point.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+import sys
 
-import discord
-from discord import app_commands
-from discord_metadata import (
-    BaseNavigator,
-    DisplayEngine,
-    EntityDef,
-    HeaderField,
-    HeaderLink,
-    MetadataBot,
-    SectionDef,
-    SummaryField,
-    SyncAPI,
-    TableColumn,
-)
+try:
+    import discord
+    from discord import app_commands
+    from discord_metadata import (
+        BaseNavigator,
+        DisplayEngine,
+        EntityDef,
+        HeaderField,
+        HeaderLink,
+        MetadataBot,
+        SectionDef,
+        SummaryField,
+        SyncAPI,
+        TableColumn,
+    )
+except ImportError as e:
+    print(
+        f"bandcamp-discord: missing dependency '{e.name}'.\n"
+        "Install the discord extras with:\n"
+        "    uv tool install 'bandcamp-explorer[discord]'\n"
+        "or:\n"
+        "    pip install 'bandcamp-explorer[discord]'",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
-from ..core.api import AlbumAPI, ArtistAPI, DiscoverAPI, SearchAPI
+from ..core.api import AlbumAPI, ArtistAPI, DiscoverWebAPI, SearchAPI
 from ..core.client import BandcampClient
-from ..core.countries import resolve_location
+from ..core.countries import resolve_geoname
+from ..core.format import (
+    album_host,
+    album_summary_extras,
+    album_title_with_duration,
+    format_date,
+    prepare_album,
+    release_type,
+)
 
 # ─── Bandcamp branding ─────────────────────────────────────────────────────
 
 BC_COLOR = 0x1DA0C3
 BC_FOOTER = "Bandcamp"
 
-# ─── Display transforms ───────────────────────────────────────────────────
-
-
-def _format_date(raw):
-    """Format '03 Mar 2026 00:00:00 GMT' → '03 Mar 2026'."""
-    if not raw:
-        return ""
-    try:
-        dt = datetime.strptime(raw, "%d %b %Y %H:%M:%S %Z")
-        return dt.strftime("%d %b %Y")
-    except ValueError:
-        return raw
-
-
-def _release_type(raw):
-    """Strip 'Release' suffix from release types."""
-    if not raw:
-        return ""
-    return raw.replace("Release", "").strip()
-
 
 def _album_title(d: dict) -> str:
     return f"{d.get('title', '')} by {d.get('artist_name', 'Unknown')}"
-
-
-def _album_host(entity):
-    """Show host name only if different from byArtist name."""
-    host = entity.get("artist", {}).get("name", "")
-    artist = entity.get("artist_name", "")
-    return host if host and host != artist else ""
 
 
 # ─── Entity definitions (Discord-adapted) ─────────────────────────────────
@@ -93,18 +85,19 @@ album_def = EntityDef(
     type_name="album",
     summary=[
         SummaryField(key="artist_name", bold=True),
-        SummaryField(key="title"),
+        SummaryField(transform=album_title_with_duration),
         SummaryField(
             transform=lambda d: ", ".join(d.get("tags", [])[:3]),
         ),
+        SummaryField(transform=album_summary_extras),
     ],
     header_title=_album_title,
     header_fields=[
         HeaderField("Artist", key="artist_name"),
-        HeaderField("Host", transform=_album_host),
+        HeaderField("Host", transform=album_host),
         HeaderField("Label", key="label"),
-        HeaderField("Date", key="release_date", transform=_format_date),
-        HeaderField("Type", key="release_type", transform=_release_type),
+        HeaderField("Date", key="release_date", transform=format_date),
+        HeaderField("Type", key="release_type", transform=release_type),
         HeaderField(
             "Formats",
             transform=lambda d: ", ".join(d.get("formats", [])),
@@ -186,25 +179,30 @@ artist_def = EntityDef(
 
 
 class _AlbumFetcher:
-    """Wraps AlbumAPI to precompute derived fields after fetching."""
+    """Wraps AlbumAPI to precompute derived fields after fetching.
+
+    Passes ``fetch_art=False`` so the embed-only Discord renderer doesn't
+    pay the cover-art download on every lookup — it uses the image URL.
+    """
 
     def __init__(self, client: BandcampClient):
         self._api = AlbumAPI(client)
 
     def get(self, ref, **kwargs):
-        entity = self._api.get(ref, **kwargs)
+        entity = self._api.get(ref, fetch_art=False, **kwargs)
         if entity:
-            # Precompute host label
-            host = entity.get("artist", {}).get("name", "")
-            artist = entity.get("artist_name", "")
-            entity["_host_label"] = f"Host: {host}" if host and host != artist else f"Artist: {artist}"
-            # Extract lyrics from tracks
-            lyrics = [t for t in entity.get("tracks", []) if t.get("lyrics")]
-            if lyrics:
-                entity["_lyrics"] = "\n\n".join(
-                    f"**{t.get('title', '')}**\n{t['lyrics'].strip()}" for t in lyrics
-                )
+            prepare_album(entity, lyrics_as_text=True)
         return entity
+
+
+class _ArtistFetcher:
+    """Wraps ArtistAPI, skipping the artist-photo byte fetch."""
+
+    def __init__(self, client: BandcampClient):
+        self._api = ArtistAPI(client)
+
+    def get(self, ref, **kwargs):
+        return self._api.get(ref, fetch_art=False, **kwargs)
 
 
 class _SearchAdapter:
@@ -228,7 +226,7 @@ engine.register(track_def, album_def, artist_def)
 
 _apis = {
     "album": SyncAPI(_AlbumFetcher(_client)),
-    "artist": SyncAPI(ArtistAPI(_client)),
+    "artist": SyncAPI(_ArtistFetcher(_client)),
     "search": SyncAPI(_SearchAdapter(_client)),
     "album_search": SyncAPI(_SearchAdapter(_client, "album")),
     "artist_search": SyncAPI(_SearchAdapter(_client, "band")),
@@ -274,57 +272,46 @@ async def cmd_track(interaction: discord.Interaction, query: str):
     await bot.navigator.search_and_navigate(interaction, query, ["track_search"])
 
 
-_SORT_CHOICES = [
-    app_commands.Choice(name="Newest", value="date"),
-    app_commands.Choice(name="Popular", value="pop"),
+_SLICE_CHOICES = [
+    app_commands.Choice(name="Newest arrivals", value="new"),
+    app_commands.Choice(name="Best-selling", value="top"),
+    app_commands.Choice(name="Surprise me", value="rand"),
 ]
+
+
+_discover_api = DiscoverWebAPI(_client)
 
 
 @bandcamp.command(name="discover", description="Browse releases by tag")
 @app_commands.describe(
     tag="Tag to browse (e.g. 'dungeon-synth', 'black-metal')",
-    sort="Sort mode (default: newest)",
+    slice="Which feed (default: newest)",
     location="Filter by location (e.g. 'france', 'paris')",
 )
-@app_commands.choices(sort=_SORT_CHOICES)
+@app_commands.choices(slice=_SLICE_CHOICES)
 async def cmd_discover(
     interaction: discord.Interaction,
     tag: str,
-    sort: app_commands.Choice[str] | None = None,
+    slice: app_commands.Choice[str] | None = None,
     location: str | None = None,
 ):
     await interaction.response.defer()
-    discover = DiscoverAPI(_client)
     tags = [t.strip().replace(" ", "-") for t in tag.split(",")]
-    sort_val = sort.value if sort else "date"
+    slice_val = slice.value if slice else "new"
 
+    geoname_id = 0
     if location:
-        tag_id = await asyncio.to_thread(resolve_location, _client, location)
-        if tag_id is None:
+        geoname_id = await asyncio.to_thread(resolve_geoname, _client, location) or 0
+        if not geoname_id:
             await interaction.followup.send(f"Unknown location: **{location}**")
             return
-        tags.append(tag_id)
 
+    fetcher = _discover_api.make_page_fetcher(tags=tags, slice_=slice_val, geoname_id=geoname_id)
     await bot.navigator.browse(
         interaction,
-        lambda s, c: _discover_page(discover, tags, sort_val, s, c),
-        title=f"Tag: {', '.join(tags)}",
+        fetcher,
+        title=f"Tag: {', '.join(tags)} [{slice_val}]",
     )
-
-
-def _discover_page(
-    discover: DiscoverAPI,
-    tags: list,
-    sort: str,
-    start: int,
-    count: int,
-) -> tuple[list[dict], int]:
-    """Adapt DiscoverAPI's page-based interface to offset-based."""
-    page = start // count + 1 if count else 1
-    results, has_more = discover.discover(tags=tags, sort=sort, page=page)
-    # Estimate total: if has_more, assume at least one more page
-    total = start + len(results) + (count if has_more else 0)
-    return results, total
 
 
 bot.tree.add_command(bandcamp)

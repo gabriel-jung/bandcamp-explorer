@@ -26,6 +26,15 @@ class BasePageParser(ABC):
         """Parse the page and return a structured dict, or None on failure."""
 
 
+_FORMAT_MAP = {
+    "DigitalFormat": "Digital",
+    "VinylFormat": "Vinyl",
+    "CDFormat": "CD",
+    "CassetteFormat": "Cassette",
+    "DVDFormat": "DVD",
+}
+
+
 class AlbumPageParser(BasePageParser):
     """Parse a Bandcamp album page.
 
@@ -67,20 +76,17 @@ class AlbumPageParser(BasePageParser):
         release = (releases or [{}])[0] if isinstance(releases, list) else (releases or {})
         is_track = data.get("@type") == "MusicRecording"
 
-        # Label from recordLabel (distinct from publisher/host)
         label = release.get("recordLabel", {})
         label_name = label.get("name") if isinstance(label, dict) else None
 
-        # Media formats (Digital, Cassette, Vinyl, CD)
         formats = self._parse_formats(releases if isinstance(releases, list) else [])
 
-        # Catalog number from creditText or release description
+        # creditText often holds copyright rather than a catalog number —
+        # keep only short, non-copyright strings.
         catalog = data.get("creditText") or ""
-        # creditText often contains copyright, not catalog — only use if short
         if len(catalog) > 30 or catalog.startswith("©"):
             catalog = ""
 
-        # Supporters count
         sponsors = data.get("sponsor", [])
         num_supporters = len(sponsors) if isinstance(sponsors, list) else 0
 
@@ -107,20 +113,12 @@ class AlbumPageParser(BasePageParser):
     @staticmethod
     def _parse_formats(releases: list) -> list[str]:
         """Extract unique media format names from albumRelease entries."""
-        _FORMAT_MAP = {
-            "DigitalFormat": "Digital",
-            "VinylFormat": "Vinyl",
-            "CDFormat": "CD",
-            "CassetteFormat": "Cassette",
-            "DVDFormat": "DVD",
-        }
         seen = []
         for release in releases:
             format_type = release.get("musicReleaseFormat")
-            if format_type and format_type in _FORMAT_MAP:
-                name = _FORMAT_MAP[format_type]
-                if name not in seen:
-                    seen.append(name)
+            name = _FORMAT_MAP.get(format_type)
+            if name and name not in seen:
+                seen.append(name)
         return seen
 
     def _parse_artist(self, data: dict) -> dict:
@@ -141,11 +139,9 @@ class AlbumPageParser(BasePageParser):
         for entry in data.get("track", {}).get("itemListElement", []):
             track = entry.get("item", {})
             duration_raw = track.get("duration")
-            # Per-track artist (for compilations/VA)
             by_artist = track.get("byArtist")
             track_artist = by_artist.get("name") if isinstance(by_artist, dict) else None
 
-            # Lyrics
             recording_of = track.get("recordingOf", {})
             lyrics_obj = recording_of.get("lyrics", {}) if isinstance(recording_of, dict) else {}
             lyrics = lyrics_obj.get("text") if isinstance(lyrics_obj, dict) else None

@@ -1,8 +1,8 @@
 """Public API surface for the bandcamp_explorer core library."""
 
-from .api import AlbumAPI, ArtistAPI, DiscoverAPI, SearchAPI
+from .api import AlbumAPI, ArtistAPI, DiscoverAPI, DiscoverWebAPI, SearchAPI
 from .client import BandcampClient, NotFoundError
-from .countries import resolve_location
+from .countries import resolve_geoname, resolve_location
 
 __all__ = [
     "AlbumAPI",
@@ -10,6 +10,8 @@ __all__ = [
     "BandcampClient",
     "NotFoundError",
     "DiscoverAPI",
+    "DiscoverWebAPI",
     "SearchAPI",
+    "resolve_geoname",
     "resolve_location",
 ]

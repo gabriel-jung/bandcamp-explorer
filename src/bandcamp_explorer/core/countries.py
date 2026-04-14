@@ -12,30 +12,47 @@ value — the CLI then force-refreshes and retries.
 import html
 import json
 import re
+import threading
 from pathlib import Path
 
 from loguru import logger
 
 CACHE_DIR = Path.home() / ".cache" / "bandcamp-explorer"
 CACHE_FILE = CACHE_DIR / "locations.json"
+GEONAME_CACHE_FILE = CACHE_DIR / "geonames.json"
 
 DISCOVER_URL = "https://bandcamp.com/discover/{slug}"
+GEONAME_SEARCH_URL = "https://bandcamp.com/api/location/1/geoname_search"
+
+# Process-lifetime in-memory mirror so long-running bots don't re-read
+# the cache file on every location lookup. The lock guards concurrent
+# resolve_* calls from the Discord bot's worker threads.
+_MEMORY: dict[Path, dict[str, dict]] = {}
+_LOCK = threading.Lock()
 
 
-def _load_cache() -> dict[str, dict]:
-    """Load cached location data from disk."""
-    if not CACHE_FILE.exists():
-        return {}
-    try:
-        return json.loads(CACHE_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
+def _load_json_cache(path: Path) -> dict[str, dict]:
+    """Load a JSON cache file, memoised per-process."""
+    with _LOCK:
+        cached = _MEMORY.get(path)
+        if cached is not None:
+            return cached
+        try:
+            _MEMORY[path] = json.loads(path.read_text()) if path.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            _MEMORY[path] = {}
+        return _MEMORY[path]
 
 
-def _save_cache(data: dict[str, dict]) -> None:
-    """Save location data to disk."""
+def _save_json_cache(path: Path, data: dict[str, dict]) -> None:
+    """Atomically write a JSON cache file and refresh the in-memory mirror."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    payload = json.dumps(data, indent=2, ensure_ascii=False)
+    with _LOCK:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(payload)
+        tmp.replace(path)
+        _MEMORY[path] = data
 
 
 def _fetch_location_tag(client, slug: str) -> dict | None:
@@ -86,7 +103,7 @@ def _fetch_and_save(client, slug: str, cache: dict) -> int | None:
     result = _fetch_location_tag(client, slug)
     if result:
         cache[slug] = result
-        _save_cache(cache)
+        _save_json_cache(CACHE_FILE, cache)
         logger.info(f"Cached location: {result['label']} (tag_id={result['tag_id']})")
         return result["tag_id"]
     return None
@@ -111,7 +128,7 @@ def resolve_location(client, value: str, force: bool = False) -> int | None:
     """
     normalized = value.lower().strip()
     slug = normalized.replace(" ", "-")
-    cache = _load_cache()
+    cache = _load_json_cache(CACHE_FILE)
 
     if not force:
         # Check cache by slug
@@ -126,13 +143,52 @@ def resolve_location(client, value: str, force: bool = False) -> int | None:
     return _fetch_and_save(client, slug, cache)
 
 
+def resolve_geoname(client, value: str, force: bool = False) -> int | None:
+    """Resolve a place name to a geonames.org id for ``discover_web``.
+
+    Uses Bandcamp's ``/api/location/1/geoname_search`` endpoint (the one the
+    discover page hits for its location autocomplete) and picks the top match.
+    Cached on disk so repeat lookups are free.
+    """
+    normalized = value.lower().strip()
+    cache = _load_json_cache(GEONAME_CACHE_FILE)
+
+    if not force and normalized in cache:
+        return cache[normalized]["id"]
+
+    data = client.post_json(GEONAME_SEARCH_URL, {"q": value})
+    if not data or not data.get("ok"):
+        return None
+
+    results = data.get("results") or []
+    if not results:
+        return None
+
+    top = results[0]
+    try:
+        gid = int(top["id"])
+    except (KeyError, ValueError, TypeError):
+        return None
+
+    cache[normalized] = {
+        "id": gid,
+        "name": top.get("name"),
+        "fullname": top.get("fullname"),
+    }
+    _save_json_cache(GEONAME_CACHE_FILE, cache)
+    logger.info(f"Cached geoname: {top.get('fullname')} (id={gid})")
+    return gid
+
+
 def clear_cache() -> None:
-    """Delete the location cache file."""
-    if CACHE_FILE.exists():
-        CACHE_FILE.unlink()
-        logger.info("Location cache cleared.")
+    """Delete both location caches (on disk and in-memory)."""
+    with _LOCK:
+        for path in (CACHE_FILE, GEONAME_CACHE_FILE):
+            _MEMORY.pop(path, None)
+            path.unlink(missing_ok=True)
+            logger.info(f"Cleared cache: {path.name}")
 
 
 def list_cached_locations() -> dict[str, dict]:
     """Return all cached locations."""
-    return _load_cache()
+    return _load_json_cache(CACHE_FILE)
