@@ -2,7 +2,18 @@
 
 import re
 
+from rich_metadata import format_duration
+
 _TRACK_TIME_RE = re.compile(r"^P(?=\d)(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$")
+
+__all__ = [
+    "art_url",
+    "clean_text",
+    "find_property",
+    "format_duration",
+    "format_track_time",
+    "parse_tags",
+]
 
 
 def find_property(prop_list: list[dict], name: str) -> str | None:
@@ -39,15 +50,6 @@ def format_track_time(raw: str | None) -> str | None:
     if parts is None:
         return None
     return format_duration(parts[0] * 3600 + parts[1] * 60 + parts[2])
-
-
-def format_duration(total_seconds: int) -> str:
-    """Format seconds as "M:SS" or "H:MM:SS"."""
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}:{seconds:02d}"
-    return f"{minutes}:{seconds:02d}"
 
 
 def art_url(art_id: str | None, size: int = 2) -> str | None:

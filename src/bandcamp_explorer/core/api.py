@@ -4,6 +4,7 @@ Each entity type (album, artist, discover, search) has a dedicated API class.
 All data is returned as plain dicts with a ``_type`` discriminator key.
 """
 
+from collections.abc import Callable
 from typing import Literal
 
 from bs4 import BeautifulSoup
@@ -55,6 +56,30 @@ class BaseAPI:
         if image:
             entity["_art_data"] = self._client.get_bytes(image)
 
+    def _paginate(
+        self,
+        fetch_page: Callable[[int], tuple[list[dict], bool]],
+        max_pages: int,
+        label: str,
+    ) -> list[dict]:
+        """Accumulate pages from a ``(page) -> (items, has_more)`` fetcher.
+
+        Stops when ``has_more`` is False, the page is empty, or
+        ``max_pages`` is reached. Crawl delay is applied by the client
+        on each call.
+        """
+        all_results: list[dict] = []
+        pages_fetched = 0
+        for page in range(1, max_pages + 1):
+            results, has_more = fetch_page(page)
+            all_results.extend(results)
+            pages_fetched = page
+            logger.debug(f"Page {page}: {len(results)} {label}")
+            if not has_more or not results:
+                break
+        logger.info(f"Discovered {len(all_results)} {label} across {pages_fetched} pages.")
+        return all_results
+
 
 class AlbumAPI(BaseAPI):
     """Fetch and parse Bandcamp album pages."""
@@ -77,11 +102,9 @@ class AlbumAPI(BaseAPI):
 class DiscoverAPI(BaseAPI):
     """Browse Bandcamp releases via the legacy ``dig_deeper`` hub endpoint.
 
-    This is the old discover API. It caps around ~600 items per tag and
-    returns a leaner payload (no inline ``release_date``, ``location``,
-    ``track_count``, etc.). Prefer :class:`DiscoverWebAPI` for new work —
-    this class is kept for reference and for callers that specifically
-    need the hub's ordering or tag semantics.
+    Caps around ~600 items per tag and returns a leaner payload (no inline
+    ``release_date``, ``location``, ``track_count``, etc.). Prefer
+    :class:`DiscoverWebAPI` for new work.
     """
 
     def discover(
@@ -97,7 +120,7 @@ class DiscoverAPI(BaseAPI):
             tags: Genre and/or location tags. Country tag_ids should be
                 appended to this list for location filtering
                 (e.g. ``["dungeon-synth", 1309675381]``).
-            sort: Sort mode — "date", "pop", or "top".
+            sort: Sort mode (one of "date", "pop", "top").
             page: Page number (1-indexed).
             media_format: Format filter (default "all").
 
@@ -119,20 +142,22 @@ class DiscoverAPI(BaseAPI):
             return [], False
 
         items = data.get("items", [])
-        results = [
-            {
-                "_type": "album",
-                "album_id": item.get("tralbum_id"),
-                "artist_name": item.get("artist"),
-                "title": item.get("title"),
-                "url": item.get("tralbum_url"),
-                "artist_url": item.get("band_url"),
-                "artist_id": item.get("band_id"),
-                "art_id": str(item["art_id"]) if item.get("art_id") else None,
-                "genre": item.get("genre", ""),
-            }
-            for item in items
-        ]
+        results = []
+        for item in items:
+            art_id = item.get("art_id")
+            results.append(
+                {
+                    "_type": "album",
+                    "album_id": item.get("tralbum_id"),
+                    "artist_name": item.get("artist"),
+                    "title": item.get("title"),
+                    "url": item.get("tralbum_url"),
+                    "artist_url": item.get("band_url"),
+                    "artist_id": item.get("band_id"),
+                    "art_id": str(art_id) if art_id else None,
+                    "genre": item.get("genre", ""),
+                }
+            )
 
         return results, data.get("more_available", False)
 
@@ -147,18 +172,11 @@ class DiscoverAPI(BaseAPI):
         Keeps fetching until there are no more results or ``max_pages``
         is reached. Crawl delay is applied between pages.
         """
-        all_results = []
-        pages_fetched = 0
-        for page in range(1, max_pages + 1):
-            results, has_more = self.discover(tags=tags, sort=sort, page=page)
-            all_results.extend(results)
-            pages_fetched = page
-            logger.debug(f"Page {page}: {len(results)} releases")
-            if not has_more:
-                break
-
-        logger.info(f"Discovered {len(all_results)} releases across {pages_fetched} pages.")
-        return all_results
+        return self._paginate(
+            lambda page: self.discover(tags=tags, sort=sort, page=page),
+            max_pages=max_pages,
+            label="releases",
+        )
 
 
 def _strip_tracker(url: str | None) -> str | None:
@@ -168,13 +186,31 @@ def _strip_tracker(url: str | None) -> str | None:
     return url.split("?from=")[0]
 
 
+class _PageFetcherState:
+    """Mutable state for ``DiscoverWebAPI.make_page_fetcher``.
+
+    Holds the cursor, accumulated items, exhaustion flag, and the
+    server-reported total. The fetcher closure mutates this instead
+    of relying on a dict so attribute access is typed and the total
+    estimate stays monotonic.
+    """
+
+    __slots__ = ("cursor", "exhausted", "items", "total")
+
+    def __init__(self) -> None:
+        self.cursor: str | None = None
+        self.items: list[dict] = []
+        self.exhausted: bool = False
+        self.total: int | None = None
+
+
 class DiscoverWebAPI(BaseAPI):
     """Browse Bandcamp releases via the new ``/discover`` page endpoint.
 
     Mirrors what the public ``https://bandcamp.com/discover/<tag>?s=<slice>``
     page shows. Returns a broader set of releases than :class:`DiscoverAPI`
     (which uses the older ``dig_deeper`` hub), and carries extra fields
-    inline — ``release_date``, ``location``, ``price``, ``track_count``.
+    inline (``release_date``, ``location``, ``price``, ``track_count``).
 
     Pagination is cursor-based, not page-based.
     """
@@ -229,16 +265,18 @@ class DiscoverWebAPI(BaseAPI):
         for item in items:
             image = item.get("primary_image") or {}
             art_id = image.get("image_id")
+            item_id = item.get("item_id")
+            band_id = item.get("band_id")
             results.append(
                 {
                     "_type": "album",
-                    "album_id": str(item["item_id"]) if item.get("item_id") else None,
+                    "album_id": str(item_id) if item_id else None,
                     "artist_name": item.get("band_name"),
                     "album_artist": item.get("album_artist"),
                     "title": item.get("title"),
                     "url": _strip_tracker(item.get("item_url")),
                     "artist_url": _strip_tracker(item.get("band_url")),
-                    "artist_id": str(item["band_id"]) if item.get("band_id") else None,
+                    "artist_id": str(band_id) if band_id else None,
                     "art_id": str(art_id) if art_id else None,
                     "genre": "",
                     "item_type": item.get("item_type"),
@@ -297,31 +335,32 @@ class DiscoverWebAPI(BaseAPI):
         Wraps cursor pagination in a closure so callers can address items
         by offset, as both the CLI pager and the Discord navigator do.
         ``total`` is an estimate until the feed is exhausted, then exact.
+        Estimates never shrink across calls.
         """
-        state = {"cursor": None, "items": [], "exhausted": False, "total": None}
+        state = _PageFetcherState()
 
         def fetch(start: int, count: int) -> tuple[list[dict], int]:
-            while len(state["items"]) < start + count and not state["exhausted"]:
+            while len(state.items) < start + count and not state.exhausted:
                 results, cursor, total = self.discover(
                     tags=tags,
                     slice_=slice_,
-                    cursor=state["cursor"],
+                    cursor=state.cursor,
                     size=max(count, batch_size),
                     geoname_id=geoname_id,
                 )
-                state["items"].extend(results)
-                state["cursor"] = cursor
-                if state["total"] is None:
-                    state["total"] = total
+                state.items.extend(results)
+                state.cursor = cursor
+                if total and (state.total is None or total > state.total):
+                    state.total = total
                 if not cursor or not results:
-                    state["exhausted"] = True
+                    state.exhausted = True
 
-            items = state["items"][start : start + count]
-            if state["exhausted"]:
-                total = len(state["items"])
+            items = state.items[start : start + count]
+            if state.exhausted:
+                total_out = len(state.items)
             else:
-                total = state["total"] or (start + len(items) + count)
-            return items, total
+                total_out = max(state.total or 0, start + len(items) + count)
+            return items, total_out
 
         return fetch
 
@@ -340,7 +379,7 @@ class SearchAPI(BaseAPI):
         Args:
             query: Free-text search query.
             page: Page number (1-indexed).
-            item_type: Filter by type — "all", "band", "album", or "track".
+            item_type: Filter by type (one of "all", "band", "album", "track").
 
         Returns:
             Tuple of (list of search_result dicts, has_more).
@@ -354,7 +393,7 @@ class SearchAPI(BaseAPI):
         if not data:
             return [], False
 
-        return data["results"], data["has_more"]
+        return data.get("results", []), data.get("has_more", False)
 
 
 class ArtistAPI(BaseAPI):
@@ -376,7 +415,7 @@ class ArtistAPI(BaseAPI):
 
         # Discography lives on /music subpage
         music_url = artist_url.rstrip("/") + "/music"
-        music_page = self._get_page(music_url, ArtistPageParser)
+        music_page = self._get_page(music_url, ArtistPageParser, discography_only=True)
         if music_page and music_page.get("discography"):
             artist["discography"] = music_page["discography"]
 

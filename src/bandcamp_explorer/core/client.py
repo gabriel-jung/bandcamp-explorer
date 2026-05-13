@@ -10,8 +10,15 @@ REQUEST_TIMEOUT = 15
 _HTTP_EXCEPTIONS = curl_requests.exceptions.RequestException
 
 
-class NotFoundError(Exception):
-    """Raised when a resource returns HTTP 404."""
+class NotFoundError(_HTTP_EXCEPTIONS):
+    """Raised when a resource returns HTTP 404.
+
+    Subclasses ``curl_requests.exceptions.RequestException`` so the
+    shared ``except _HTTP_EXCEPTIONS`` handler in ``BandcampClient``
+    catches it like any other request failure and returns ``None``.
+    Callers that want to distinguish 404 from generic failures can
+    catch ``NotFoundError`` explicitly before calling the client.
+    """
 
 
 class BandcampClient:
@@ -95,10 +102,10 @@ class BandcampClient:
         """Enforce delay between requests."""
         delay = self.crawl_delay if crawl else self.rate_limit_seconds
         if self._last_request_time is not None:
-            elapsed = time.time() - self._last_request_time
+            elapsed = time.monotonic() - self._last_request_time
             if elapsed < delay:
                 time.sleep(delay - elapsed)
-        self._last_request_time = time.time()
+        self._last_request_time = time.monotonic()
 
     def close(self):
         """Close the underlying HTTP session."""

@@ -6,7 +6,7 @@ module discovers them at runtime by fetching Bandcamp's discover pages and
 caches them locally as JSON.
 
 Cached entries persist until a discover request fails with the cached
-value — the CLI then force-refreshes and retries.
+value; the CLI then force-refreshes and retries.
 """
 
 import html

@@ -1,4 +1,4 @@
-"""CLI entry point for bandcamp — a Bandcamp data browser.
+"""CLI entry point for bandcamp, a Bandcamp data browser.
 
 Usage::
 
@@ -27,12 +27,13 @@ from rich_metadata import (
     SummaryField,
     TableColumn,
     configure_logging,
+    links_line,
     page_fetcher,
     strip_internal_keys,
 )
 
 from .. import __version__
-from ..core.api import AlbumAPI, ArtistAPI, DiscoverWebAPI, SearchAPI
+from ..core.api import ArtistAPI, DiscoverWebAPI, SearchAPI
 from ..core.client import BandcampClient
 from ..core.countries import resolve_geoname
 from ..core.format import (
@@ -40,14 +41,14 @@ from ..core.format import (
     album_summary_extras,
     album_title_with_duration,
     format_date,
-    prepare_album,
     release_type,
 )
+from .common import AlbumFetcher
 
 
 def _render_lyrics(console, entity):
     """Custom section renderer for album lyrics."""
-    tracks = entity.get("_lyrics", [])
+    tracks = entity.get("_lyrics_tracks", [])
     if not tracks:
         console.print("\n[dim]No lyrics available.[/dim]")
         return
@@ -55,7 +56,7 @@ def _render_lyrics(console, entity):
     for track in tracks:
         title = track.get("title", "")
         artist = track.get("artist")
-        header = f"{title} — {artist}" if artist else title
+        header = f"{title} ({artist})" if artist else title
         console.print()
         console.print(
             Panel(
@@ -85,7 +86,7 @@ track_def = EntityDef(
     sections=[
         SectionDef("lyrics"),
     ],
-    footer=["track_url"],
+    footer=[lambda d: links_line(("page", d.get("track_url")))],
     auto_full=True,
 )
 
@@ -150,7 +151,7 @@ album_def = EntityDef(
             ],
         ),
         SectionDef("description"),
-        SectionDef("_lyrics", label="Lyrics", custom_render=_render_lyrics),
+        SectionDef("_lyrics_tracks", label="Lyrics", custom_render=_render_lyrics),
     ],
     header_links=[
         HeaderLink(
@@ -159,7 +160,12 @@ album_def = EntityDef(
             ref_fn=lambda d: d.get("artist", {}).get("url"),
         ),
     ],
-    footer=["image_url"],
+    footer=[
+        lambda d: links_line(
+            ("page", d.get("url")),
+            ("cover", d.get("image_url")),
+        ),
+    ],
 )
 
 artist_def = EntityDef(
@@ -188,7 +194,12 @@ artist_def = EntityDef(
     header_links=[
         HeaderLink("Label: {label}", "artist", ref_key="label_url"),
     ],
-    footer=["image_url"],
+    footer=[
+        lambda d: links_line(
+            ("page", d.get("url")),
+            ("photo", d.get("image_url")),
+        ),
+    ],
 )
 
 engine = DisplayEngine()
@@ -199,24 +210,10 @@ console = engine.console
 # ─── Engine & navigator setup ────────────────────────────────────────────────
 
 
-class _AlbumFetcher:
-    """Wraps AlbumAPI to apply display transforms after fetching."""
-
-    def __init__(self, client: BandcampClient):
-        self._api = AlbumAPI(client)
-
-    def get(self, ref, **kwargs):
-        entity = self._api.get(ref, **kwargs)
-        if entity:
-            prepare_album(entity)
-        return entity
-
-
 def _make_navigator(client: BandcampClient) -> BaseNavigator:
     """Create a navigator wired to all Bandcamp APIs."""
-    album_fetcher = _AlbumFetcher(client)
     apis = {
-        "album": album_fetcher,
+        "album": AlbumFetcher(client),
         "artist": ArtistAPI(client),
         "search": SearchAPI(client),
         "discover": DiscoverWebAPI(client),
@@ -327,15 +324,15 @@ def _build_parser():
 # ─── Search/browse commands ──────────────────────────────────────────────────
 
 
+_ITEM_TYPE_FLAGS = {"artist": "band", "album": "album", "track": "track"}
+
+
 def _resolve_item_type(args):
     """Determine the item_type filter from --artist, --album, --track flags."""
-    if args.artist:
-        return "band"
-    if args.album:
-        return "album"
-    if args.track:
-        return "track"
-    return "all"
+    return next(
+        (item_type for flag, item_type in _ITEM_TYPE_FLAGS.items() if getattr(args, flag)),
+        "all",
+    )
 
 
 def _is_bandcamp_url(text):
@@ -466,7 +463,7 @@ def _run_tag_browse(nav, client, args):
 
 
 def main():
-    """CLI entry point — parse args, configure logging, dispatch."""
+    """CLI entry point: parse args, configure logging, dispatch."""
     parser = _build_parser()
     args = parser.parse_args()
 

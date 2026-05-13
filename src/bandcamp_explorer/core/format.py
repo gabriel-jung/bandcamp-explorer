@@ -24,11 +24,7 @@ def format_date(raw: str | None) -> str:
 
 
 def format_duration_pretty(seconds: float | int | None) -> str:
-    """Format a duration in seconds as 'Mm SSs' or 'Hh MMm'.
-
-    Distinct from ``core.utils.format_duration`` which returns ``M:SS``
-    — this variant is meant for inline summary display.
-    """
+    """Format a duration in seconds as 'Mm SSs' or 'Hh MMm' for inline display."""
     if not seconds:
         return ""
     total = int(seconds)
@@ -75,23 +71,3 @@ def album_host(entity: dict) -> str:
     host = entity.get("artist", {}).get("name", "")
     artist = entity.get("artist_name", "")
     return host if host and host != artist else ""
-
-
-def prepare_album(album: dict, *, lyrics_as_text: bool = False) -> None:
-    """Precompute app-friendly derived fields on an album entity.
-
-    Adds ``_host_label`` (labelled host/artist line) and, when any track
-    has lyrics, ``_lyrics`` — either a list of track dicts (for custom
-    rendering) or a single joined string when ``lyrics_as_text=True``.
-    """
-    host = album_host(album)
-    artist = album.get("artist_name", "")
-    album["_host_label"] = f"Host: {host}" if host else f"Artist: {artist}"
-
-    lyrics = [t for t in album.get("tracks", []) if t.get("lyrics")]
-    if not lyrics:
-        return
-    if lyrics_as_text:
-        album["_lyrics"] = "\n\n".join(f"**{t.get('title', '')}**\n{t['lyrics'].strip()}" for t in lyrics)
-    else:
-        album["_lyrics"] = lyrics

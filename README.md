@@ -3,7 +3,7 @@
 A terminal browser and Python library for [Bandcamp](https://bandcamp.com).
 
 Search for artists and albums, discover releases by genre and location,
-browse artist/label profiles and discographies — all from the command line.
+browse artist/label profiles and discographies, all from the command line.
 
 ## Install
 
@@ -97,9 +97,9 @@ bandcamp https://erang.bandcamp.com
 
 After selecting a result, you enter an interactive browser:
 
-- **Artists** — view bio, browse discography, select an album to see its
+- **Artists**: view bio, browse discography, select an album to see its
   tracklist, select a track to view its page, navigate to the label.
-- **Albums** — header with tracklist, description, and lyrics; navigate
+- **Albums**: header with tracklist, description, and lyrics; navigate
   to the artist/host page or select a track.
 
 Press `0` to go back, `Ctrl+C` to quit.
@@ -121,7 +121,7 @@ iTerm2 or Kitty image protocol (iTerm2, Kitty, WezTerm, Mintty).
 
 ## Library
 
-The `core` module has no terminal dependencies — use it in scripts,
+The `core` module has no terminal dependencies; use it in scripts,
 pipelines, or other tools. All data is returned as plain dicts with a
 `_type` discriminator key.
 
@@ -162,7 +162,7 @@ with BandcampClient() as client:
 > `resolve_location` (location-tag resolver) are still exported for
 > callers that specifically need them, but `DiscoverWebAPI` returns a
 > broader feed with richer inline fields (`release_date`, `location`,
-> `duration`, `price`, …) and is the recommended entry point.
+> `duration`, `price`, ...) and is the recommended entry point.
 
 ## License
 

@@ -2,7 +2,7 @@
 
 import json
 from abc import ABC, abstractmethod
-from urllib.parse import urlparse
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 from loguru import logger
@@ -47,9 +47,24 @@ class AlbumPageParser(BasePageParser):
         if not data:
             return None
 
-        album = self._parse_album(data)
-        album["artist"] = self._parse_artist(data)
-        album["tracks"] = self._parse_tracks(data, album["album_id"])
+        try:
+            album = self._parse_album(data)
+        except Exception as e:
+            logger.error(f"Failed to parse album block on {self.url}: {e}")
+            return None
+
+        try:
+            album["artist"] = self._parse_artist(data)
+        except Exception as e:
+            logger.warning(f"Failed to parse artist block on {self.url}: {e}")
+            album["artist"] = {"_type": "artist"}
+
+        try:
+            album["tracks"] = self._parse_tracks(data, album.get("album_id"))
+        except Exception as e:
+            logger.warning(f"Failed to parse tracks block on {self.url}: {e}")
+            album["tracks"] = []
+
         return album
 
     def _extract_json_ld(self) -> dict | None:
@@ -81,7 +96,7 @@ class AlbumPageParser(BasePageParser):
 
         formats = self._parse_formats(releases if isinstance(releases, list) else [])
 
-        # creditText often holds copyright rather than a catalog number —
+        # creditText often holds copyright rather than a catalog number;
         # keep only short, non-copyright strings.
         catalog = data.get("creditText") or ""
         if len(catalog) > 30 or catalog.startswith("©"):
@@ -167,12 +182,36 @@ class ArtistPageParser(BasePageParser):
     """Parse a Bandcamp artist/label page.
 
     Extracts profile info (name, location, bio, image) from the root page
-    and the discography grid from the ``/music`` subpage.
+    and the discography grid from the ``/music`` subpage. Set
+    ``discography_only=True`` to skip profile extraction when the caller
+    has already fetched it from the root page.
     """
 
+    def __init__(self, soup: BeautifulSoup, url: str, *, discography_only: bool = False):
+        super().__init__(soup, url)
+        self._discography_only = discography_only
+
     def parse(self) -> dict | None:
-        artist = self._parse_profile()
-        artist["discography"] = self._parse_discography()
+        if self._discography_only:
+            try:
+                discography = self._parse_discography()
+            except Exception as e:
+                logger.warning(f"Failed to parse discography on {self.url}: {e}")
+                discography = []
+            return {"_type": "artist", "discography": discography}
+
+        try:
+            artist = self._parse_profile()
+        except Exception as e:
+            logger.error(f"Failed to parse artist profile on {self.url}: {e}")
+            return None
+
+        try:
+            artist["discography"] = self._parse_discography()
+        except Exception as e:
+            logger.warning(f"Failed to parse discography on {self.url}: {e}")
+            artist["discography"] = []
+
         return artist
 
     def _parse_profile(self) -> dict:
@@ -242,11 +281,8 @@ class ArtistPageParser(BasePageParser):
         if not music_grid:
             return []
 
-        parsed = urlparse(self.url)
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
         items = []
 
-        # Parse visible HTML grid items
         for grid_item in music_grid.find_all("li"):
             link = grid_item.find("a")
             if not link:
@@ -261,16 +297,11 @@ class ArtistPageParser(BasePageParser):
                     artist_name = clean_text(artist_span.extract().get_text())
                 title = clean_text(title_el.get_text())
 
-            # Extract item type from data-item-id (e.g. "album-123")
             data_item_id = grid_item.get("data-item-id", "")
-            item_type = data_item_id.split("-")[0] if "-" in data_item_id else None
+            item_type = data_item_id.split("-", 1)[0] if "-" in data_item_id else None
 
             art_el = grid_item.find("img")
             artwork_url = art_el.get("src") if art_el else None
-
-            href = link.get("href", "")
-            if href.startswith("/"):
-                href = base_url + href
 
             items.append(
                 {
@@ -278,32 +309,29 @@ class ArtistPageParser(BasePageParser):
                     "title": title,
                     "artist_name": artist_name,
                     "item_type": item_type,
-                    "url": href,
+                    "url": urljoin(self.url, link.get("href", "")),
                     "art_url": artwork_url,
                 }
             )
 
-        # Parse overflow items from data-client-items JSON
         client_items_json = music_grid.get("data-client-items")
         if client_items_json:
             try:
                 extra_items = json.loads(client_items_json)
-                for entry in extra_items:
-                    href = entry.get("page_url", "")
-                    if href.startswith("/"):
-                        href = base_url + href
-                    items.append(
-                        {
-                            "_type": "album",
-                            "title": entry.get("title", ""),
-                            "artist_name": entry.get("artist"),
-                            "item_type": entry.get("type"),
-                            "url": href,
-                            "art_url": None,
-                        }
-                    )
-            except (json.JSONDecodeError, TypeError):
-                pass
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning(f"Failed to parse data-client-items on {self.url}: {e}")
+                extra_items = []
+            for entry in extra_items:
+                items.append(
+                    {
+                        "_type": "album",
+                        "title": entry.get("title", ""),
+                        "artist_name": entry.get("artist"),
+                        "item_type": entry.get("type"),
+                        "url": urljoin(self.url, entry.get("page_url", "")),
+                        "art_url": None,
+                    }
+                )
 
         return items
 
@@ -356,7 +384,7 @@ class SearchPageParser(BasePageParser):
         if url_el:
             url = clean_text(url_el.get_text())
 
-        # Subhead — location for bands, "by Artist" for albums/tracks
+        # Subhead: location for bands, "by Artist" for albums/tracks
         subhead = ""
         subhead_el = result_item.select_one(".subhead")
         if subhead_el:
@@ -376,16 +404,15 @@ class SearchPageParser(BasePageParser):
         tags_el = result_item.select_one(".tags")
         if tags_el:
             tags_text = clean_text(tags_el.get_text())
-            # Strip localized prefix like "catégories : " or "tags : "
             if ":" in tags_text:
                 tags_text = tags_text.split(":", 1)[1].strip()
-            tags = [tag.strip() for tag in tags_text.split(",") if tag.strip()]
+            tags = parse_tags(tags_text)
 
         # Image URL from .art img
         img_el = result_item.select_one(".art img")
         image_url = img_el.get("src") if img_el else None
 
-        # Build result — normalize fields to match entity definitions
+        # Build result, normalize fields to match entity definitions
         result = {"_type": entity_type, "url": url, "genre": genre, "tags": tags, "image_url": image_url}
 
         if entity_type == "artist":

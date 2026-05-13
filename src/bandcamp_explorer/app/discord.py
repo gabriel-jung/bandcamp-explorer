@@ -35,7 +35,7 @@ except ImportError as e:
     )
     sys.exit(1)
 
-from ..core.api import AlbumAPI, ArtistAPI, DiscoverWebAPI, SearchAPI
+from ..core.api import DiscoverWebAPI
 from ..core.client import BandcampClient
 from ..core.countries import resolve_geoname
 from ..core.format import (
@@ -43,9 +43,9 @@ from ..core.format import (
     album_summary_extras,
     album_title_with_duration,
     format_date,
-    prepare_album,
     release_type,
 )
+from .common import AlbumFetcher, ArtistFetcher, SearchAdapter
 
 # ─── Bandcamp branding ─────────────────────────────────────────────────────
 
@@ -129,7 +129,7 @@ album_def = EntityDef(
             ],
         ),
         SectionDef("description"),
-        SectionDef("_lyrics", label="Lyrics"),
+        SectionDef("_lyrics_text", label="Lyrics"),
     ],
     header_links=[
         HeaderLink(
@@ -175,72 +175,37 @@ artist_def = EntityDef(
 )
 
 
-# ─── API adapter ──────────────────────────────────────────────────────────
-
-
-class _AlbumFetcher:
-    """Wraps AlbumAPI to precompute derived fields after fetching.
-
-    Passes ``fetch_art=False`` so the embed-only Discord renderer doesn't
-    pay the cover-art download on every lookup — it uses the image URL.
-    """
-
-    def __init__(self, client: BandcampClient):
-        self._api = AlbumAPI(client)
-
-    def get(self, ref, **kwargs):
-        entity = self._api.get(ref, fetch_art=False, **kwargs)
-        if entity:
-            prepare_album(entity, lyrics_as_text=True)
-        return entity
-
-
-class _ArtistFetcher:
-    """Wraps ArtistAPI, skipping the artist-photo byte fetch."""
-
-    def __init__(self, client: BandcampClient):
-        self._api = ArtistAPI(client)
-
-    def get(self, ref, **kwargs):
-        return self._api.get(ref, fetch_art=False, **kwargs)
-
-
-class _SearchAdapter:
-    """Adapts SearchAPI to the expected async search(query) -> list interface."""
-
-    def __init__(self, client: BandcampClient, item_type: str = "all"):
-        self._api = SearchAPI(client)
-        self._item_type = item_type
-
-    def search(self, query: str, **kwargs) -> list[dict]:
-        results, _ = self._api.search(query=query, page=1, item_type=self._item_type)
-        return results
-
-
 # ─── Engine & bot setup ───────────────────────────────────────────────────
-
-_client = BandcampClient()
 
 engine = DisplayEngine()
 engine.register(track_def, album_def, artist_def)
 
-_apis = {
-    "album": SyncAPI(_AlbumFetcher(_client)),
-    "artist": SyncAPI(_ArtistFetcher(_client)),
-    "search": SyncAPI(_SearchAdapter(_client)),
-    "album_search": SyncAPI(_SearchAdapter(_client, "album")),
-    "artist_search": SyncAPI(_SearchAdapter(_client, "band")),
-    "track_search": SyncAPI(_SearchAdapter(_client, "track")),
-}
 
-navigator = BaseNavigator(
-    engine,
-    apis=_apis,
-    ephemeral=False,
-    placeholder="Browse sections & navigate\u2026",
-)
+def _build_bot() -> tuple[MetadataBot, BandcampClient, DiscoverWebAPI]:
+    """Construct HTTP client, navigator, and bot inside ``main()`` so
+    importing this module does not open a curl-cffi session."""
+    client = BandcampClient()
+    apis = {
+        "album": SyncAPI(AlbumFetcher(client, fetch_art=False, lyrics_as_text=True)),
+        "artist": SyncAPI(ArtistFetcher(client, fetch_art=False)),
+        "search": SyncAPI(SearchAdapter(client)),
+        "album_search": SyncAPI(SearchAdapter(client, "album")),
+        "artist_search": SyncAPI(SearchAdapter(client, "band")),
+        "track_search": SyncAPI(SearchAdapter(client, "track")),
+    }
+    navigator = BaseNavigator(
+        engine,
+        apis=apis,
+        ephemeral=False,
+        placeholder="Browse sections & navigate…",
+    )
+    return MetadataBot(navigator, on_close=client.close), client, DiscoverWebAPI(client)
 
-bot = MetadataBot(navigator, on_close=_client.close)
+
+# Initialized in main(); referenced by slash command handlers below.
+bot: MetadataBot
+_discover_api: DiscoverWebAPI
+_client: BandcampClient
 
 
 # ─── Slash commands (grouped under /bandcamp) ─────────────────────────────
@@ -279,9 +244,6 @@ _SLICE_CHOICES = [
 ]
 
 
-_discover_api = DiscoverWebAPI(_client)
-
-
 @bandcamp.command(name="discover", description="Browse releases by tag")
 @app_commands.describe(
     tag="Tag to browse (e.g. 'dungeon-synth', 'black-metal')",
@@ -314,13 +276,14 @@ async def cmd_discover(
     )
 
 
-bot.tree.add_command(bandcamp)
-
 # ─── Entry point ─────────────────────────────────────────────────────────
 
 
 def main():
     """Run the Bandcamp Discord bot."""
+    global bot, _client, _discover_api
+    bot, _client, _discover_api = _build_bot()
+    bot.tree.add_command(bandcamp)
     bot.run_with_args("DISCORD_TOKEN")
 
 
