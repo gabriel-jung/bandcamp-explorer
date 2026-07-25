@@ -1,21 +1,38 @@
 name: Publish to PyPI
 
+# Publishes on a version tag (v0.5.3, ...) via trusted publishing:
+# no API token, PyPI trusts this repo + workflow through GitHub OIDC.
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
+
+permissions: {}
 
 jobs:
-  publish:
+  build:
+    # No test suite here, so lint + build are the gate that runs on the
+    # tagged commit before publish.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - run: uv sync --all-extras --group dev
+      - run: uv run ruff check
+      - run: uv build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
-      - name: Build
-        run: uv build
-
-      - name: Publish
-        run: uv publish --token ${{ secrets.PYPI_TOKEN }}
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # OIDC token for trusted publishing
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
