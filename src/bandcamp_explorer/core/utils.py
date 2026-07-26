@@ -4,7 +4,12 @@ import re
 
 from rich_metadata import format_duration
 
-_TRACK_TIME_RE = re.compile(r"^P(?=\d)(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$")
+# Bandcamp writes durations as "P00H03M45S", which omits the ISO-8601 "T"
+# separator. The optional T keeps the standard "PT3M45S" form working too, so
+# a switch upstream would not silently drop every duration. The lookahead
+# rejects a bare "P"/"PT" with no components, which must read as unknown
+# rather than as a real zero.
+_TRACK_TIME_RE = re.compile(r"^P(?=T?\d)T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$")
 
 __all__ = [
     "art_url",
