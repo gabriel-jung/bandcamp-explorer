@@ -66,6 +66,9 @@ class AlbumAPI(BaseAPI):
         When ``fetch_art`` is true, cover art bytes are attached as
         ``_art_data`` (useful for terminal rendering). Callers that only
         need the image URL can pass ``False`` to skip the extra request.
+
+        A 404 propagates as ``NotFoundError`` so callers can tell a deleted
+        album from a failed fetch; every other transport failure returns None.
         """
         album = self._get_page(album_url, AlbumPageParser)
         if not album:
