@@ -28,13 +28,13 @@ from rich_metadata import (
     TableColumn,
     configure_logging,
     links_line,
-    page_fetcher,
+    list_fetcher,
     strip_internal_keys,
 )
 
 from .. import __version__
-from ..core.api import ArtistAPI, DiscoverWebAPI, SearchAPI
-from ..core.client import BandcampClient
+from ..core.api import DiscoverWebAPI, SearchAPI
+from ..core.client import BandcampClient, ChallengeError
 from ..core.countries import resolve_geoname
 from ..core.format import (
     album_host,
@@ -42,8 +42,9 @@ from ..core.format import (
     album_title_with_duration,
     format_date,
     release_type,
+    supporters_label,
 )
-from .common import AlbumFetcher
+from .common import AlbumFetcher, ArtistFetcher
 
 
 def _render_lyrics(console, entity):
@@ -120,10 +121,7 @@ album_def = EntityDef(
             transform=lambda d: d.get("artist", {}).get("location", ""),
         ),
         HeaderField("URL", key="url"),
-        HeaderField(
-            "Supporters",
-            transform=lambda d: str(d["num_supporters"]) if d.get("num_supporters") else "",
-        ),
+        HeaderField("Supporters", transform=supporters_label),
     ],
     sections=[
         SectionDef(
@@ -214,7 +212,7 @@ def _make_navigator(client: BandcampClient) -> BaseNavigator:
     """Create a navigator wired to all Bandcamp APIs."""
     apis = {
         "album": AlbumFetcher(client),
-        "artist": ArtistAPI(client),
+        "artist": ArtistFetcher(client),
         "search": SearchAPI(client),
         "discover": DiscoverWebAPI(client),
     }
@@ -299,7 +297,7 @@ def _build_parser():
         "--limit",
         type=int,
         default=None,
-        help="Cap results for --tag --json (default: unlimited)",
+        help="Cap the number of results (default: unlimited)",
     )
     parser.add_argument(
         "--full",
@@ -336,8 +334,12 @@ def _resolve_item_type(args):
 
 
 def _is_bandcamp_url(text):
-    """Check if text looks like a Bandcamp URL."""
-    return "bandcamp.com" in text
+    """Check if text looks like a page URL rather than a search query.
+
+    Artists on Bandcamp Pro serve from their own domain, so matching only
+    "bandcamp.com" would send those URLs to the search endpoint instead.
+    """
+    return text.startswith(("http://", "https://")) or "bandcamp.com/" in text
 
 
 def _run_url(nav, args):
@@ -354,34 +356,23 @@ def _run_url(nav, args):
 
 
 def _run_search(nav, args):
-    """Text search with paginated results."""
+    """Text search. The endpoint returns the whole result set in one call."""
     search = nav.apis["search"]
     query = " ".join(args.query)
     item_type = _resolve_item_type(args)
 
     with console.status("Searching..."):
-        results, has_more = search.search(
-            query=query,
-            page=1,
-            item_type=item_type,
-        )
+        results = search.search(query=query, item_type=item_type)
 
     if not results:
         console.print("[dim]No results found.[/dim]")
         return
 
+    if args.limit:
+        results = results[: args.limit]
+
     if args.json:
-        all_results = list(results)
-        page = 1
-        while has_more:
-            page += 1
-            more, has_more = search.search(
-                query=query,
-                page=page,
-                item_type=item_type,
-            )
-            all_results.extend(more)
-        print(json.dumps(strip_internal_keys(all_results), indent=2, ensure_ascii=False))
+        print(json.dumps(strip_internal_keys(results), indent=2, ensure_ascii=False))
         return
 
     if args.full:
@@ -391,12 +382,9 @@ def _run_search(nav, args):
         return
 
     nav.browse(
-        fetch_page=page_fetcher(
-            lambda p: search.search(query=query, page=p, item_type=item_type),
-            first_page=(results, has_more),
-        ),
+        fetch_page=list_fetcher(results),
         title=f'Search: "{query}"',
-        page_size=len(results),
+        page_size=25,
         loop=True,
     )
 
@@ -486,3 +474,10 @@ def main():
                 _run_search(nav, args)
         except (QuitSignal, KeyboardInterrupt):
             pass
+        except ChallengeError as e:
+            console.print(
+                "[red]Bandcamp served a bot-defence challenge and refused the request.[/red]\n"
+                f"[dim]{e}[/dim]\n"
+                "[dim]Wait a couple of minutes and try again.[/dim]"
+            )
+            sys.exit(1)

@@ -36,7 +36,7 @@ except ImportError as e:
     sys.exit(1)
 
 from ..core.api import DiscoverWebAPI
-from ..core.client import BandcampClient
+from ..core.client import BandcampClient, ChallengeError
 from ..core.countries import resolve_geoname
 from ..core.format import (
     album_host,
@@ -44,6 +44,7 @@ from ..core.format import (
     album_title_with_duration,
     format_date,
     release_type,
+    supporters_label,
 )
 from .common import AlbumFetcher, ArtistFetcher, SearchAdapter
 
@@ -108,10 +109,7 @@ album_def = EntityDef(
             "Location",
             transform=lambda d: d.get("artist", {}).get("location", ""),
         ),
-        HeaderField(
-            "Supporters",
-            transform=lambda d: str(d["num_supporters"]) if d.get("num_supporters") else "",
-        ),
+        HeaderField("Supporters", transform=supporters_label),
     ],
     image_url_key="image_url",
     sections=[
@@ -212,29 +210,47 @@ _client: BandcampClient
 
 bandcamp = app_commands.Group(name="bandcamp", description="Browse Bandcamp")
 
+CHALLENGE_MESSAGE = "Bandcamp is serving a bot-defence challenge right now. Try again in a couple of minutes."
+
+
+async def _reply(interaction: discord.Interaction, message: str) -> None:
+    """Reply whether or not the interaction has already been deferred."""
+    if interaction.response.is_done():
+        await interaction.followup.send(message)
+    else:
+        await interaction.response.send_message(message)
+
+
+async def _search(interaction: discord.Interaction, query: str, api_key: str) -> None:
+    """Run a search command, surfacing a challenge instead of an empty result."""
+    try:
+        await bot.navigator.search_and_navigate(interaction, query, [api_key])
+    except ChallengeError:
+        await _reply(interaction, CHALLENGE_MESSAGE)
+
 
 @bandcamp.command(name="search", description="Search Bandcamp")
 @app_commands.describe(query="Search query")
 async def cmd_search(interaction: discord.Interaction, query: str):
-    await bot.navigator.search_and_navigate(interaction, query, ["search"])
+    await _search(interaction, query, "search")
 
 
 @bandcamp.command(name="album", description="Search for an album")
 @app_commands.describe(query="Album title")
 async def cmd_album(interaction: discord.Interaction, query: str):
-    await bot.navigator.search_and_navigate(interaction, query, ["album_search"])
+    await _search(interaction, query, "album_search")
 
 
 @bandcamp.command(name="artist", description="Search for an artist")
 @app_commands.describe(query="Artist or label name")
 async def cmd_artist(interaction: discord.Interaction, query: str):
-    await bot.navigator.search_and_navigate(interaction, query, ["artist_search"])
+    await _search(interaction, query, "artist_search")
 
 
 @bandcamp.command(name="track", description="Search for a track")
 @app_commands.describe(query="Track title")
 async def cmd_track(interaction: discord.Interaction, query: str):
-    await bot.navigator.search_and_navigate(interaction, query, ["track_search"])
+    await _search(interaction, query, "track_search")
 
 
 _SLICE_CHOICES = [
@@ -261,19 +277,22 @@ async def cmd_discover(
     tags = [t.strip().replace(" ", "-") for t in tag.split(",")]
     slice_val = slice.value if slice else "new"
 
-    geoname_id = 0
-    if location:
-        geoname_id = await asyncio.to_thread(resolve_geoname, _client, location) or 0
-        if not geoname_id:
-            await interaction.followup.send(f"Unknown location: **{location}**")
-            return
+    try:
+        geoname_id = 0
+        if location:
+            geoname_id = await asyncio.to_thread(resolve_geoname, _client, location) or 0
+            if not geoname_id:
+                await interaction.followup.send(f"Unknown location: **{location}**")
+                return
 
-    fetcher = _discover_api.make_page_fetcher(tags=tags, slice_=slice_val, geoname_id=geoname_id)
-    await bot.navigator.browse(
-        interaction,
-        fetcher,
-        title=f"Tag: {', '.join(tags)} [{slice_val}]",
-    )
+        fetcher = _discover_api.make_page_fetcher(tags=tags, slice_=slice_val, geoname_id=geoname_id)
+        await bot.navigator.browse(
+            interaction,
+            fetcher,
+            title=f"Tag: {', '.join(tags)} [{slice_val}]",
+        )
+    except ChallengeError:
+        await _reply(interaction, CHALLENGE_MESSAGE)
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────

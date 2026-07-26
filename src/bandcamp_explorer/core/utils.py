@@ -13,7 +13,21 @@ __all__ = [
     "format_duration",
     "format_track_time",
     "parse_tags",
+    "strip_tracker",
+    "track_time_to_seconds",
 ]
+
+
+def strip_tracker(url: str | None) -> str | None:
+    """Drop the query string Bandcamp appends to item URLs.
+
+    Covers both the ``?from=discover_page`` tracker on discover results and
+    the ``?label=...&tab=music`` referrer on label discography links. Bandcamp
+    item URLs carry no meaningful query parameters, so the whole string goes.
+    """
+    if not url:
+        return url
+    return url.split("?", 1)[0]
 
 
 def find_property(prop_list: list[dict], name: str) -> str | None:
@@ -44,12 +58,20 @@ def _parse_track_time(raw: str | None) -> tuple[int, int, int] | None:
     return int(match.group(1) or 0), int(match.group(2) or 0), int(match.group(3) or 0)
 
 
-def format_track_time(raw: str | None) -> str | None:
-    """Convert Bandcamp track duration (e.g. "P00H03M45S") to "3:45"."""
+def track_time_to_seconds(raw: str | None) -> int | None:
+    """Convert Bandcamp track duration (e.g. "P00H03M45S") to seconds."""
     parts = _parse_track_time(raw)
     if parts is None:
         return None
-    return format_duration(parts[0] * 3600 + parts[1] * 60 + parts[2])
+    return parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def format_track_time(raw: str | None) -> str | None:
+    """Convert Bandcamp track duration (e.g. "P00H03M45S") to "3:45"."""
+    seconds = track_time_to_seconds(raw)
+    if seconds is None:
+        return None
+    return format_duration(seconds)
 
 
 def art_url(art_id: str | None, size: int = 2) -> str | None:

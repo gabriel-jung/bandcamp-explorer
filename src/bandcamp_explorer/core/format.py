@@ -59,6 +59,14 @@ def album_summary_extras(entity: dict) -> str:
     return " · ".join(parts)
 
 
+def supporters_label(entity: dict) -> str:
+    """Supporter count, suffixed '+' when the page only listed a capped subset."""
+    count = entity.get("num_supporters")
+    if not count:
+        return ""
+    return f"{count}+" if entity.get("num_supporters_capped") else str(count)
+
+
 def release_type(raw: str | None) -> str:
     """Strip 'Release' suffix from release types."""
     if not raw:

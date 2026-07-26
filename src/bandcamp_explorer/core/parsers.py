@@ -1,4 +1,9 @@
-"""Page parsers for Bandcamp album, artist, and search pages."""
+"""Page parsers for Bandcamp album and artist pages.
+
+Search is not parsed from HTML: Bandcamp fronts ``/search`` with a
+bot-defence interstitial, so :class:`~bandcamp_explorer.core.api.SearchAPI`
+uses the site's JSON search endpoint instead.
+"""
 
 import json
 from abc import ABC, abstractmethod
@@ -7,7 +12,14 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from loguru import logger
 
-from .utils import clean_text, find_property, format_track_time, parse_tags
+from .utils import (
+    clean_text,
+    find_property,
+    format_track_time,
+    parse_tags,
+    strip_tracker,
+    track_time_to_seconds,
+)
 
 
 class BasePageParser(ABC):
@@ -102,8 +114,12 @@ class AlbumPageParser(BasePageParser):
         if len(catalog) > 30 or catalog.startswith("©"):
             catalog = ""
 
+        # JSON-LD lists only the supporters the page renders (80 at the time of
+        # writing) and offers a "more" link for the rest, so this is a floor,
+        # not a total. num_supporters_capped says which one you are looking at.
         sponsors = data.get("sponsor", [])
         num_supporters = len(sponsors) if isinstance(sponsors, list) else 0
+        supporters_capped = bool(self.soup.select_one(".collected-by .more-thumbs"))
 
         return {
             "_type": "album",
@@ -123,6 +139,11 @@ class AlbumPageParser(BasePageParser):
             "formats": formats,
             "catalog": catalog or None,
             "num_supporters": num_supporters,
+            "num_supporters_capped": supporters_capped,
+            # Track pages describe a single recording, so the album-level
+            # duration is that track's; album pages have no duration of
+            # their own and leave this None.
+            "duration": track_time_to_seconds(data.get("duration")) if is_track else None,
         }
 
     @staticmethod
@@ -149,33 +170,50 @@ class AlbumPageParser(BasePageParser):
         }
 
     def _parse_tracks(self, data: dict, album_id: str | None) -> list[dict]:
-        """Extract the tracklist from JSON-LD itemListElement entries."""
-        tracks = []
-        for entry in data.get("track", {}).get("itemListElement", []):
-            track = entry.get("item", {})
-            duration_raw = track.get("duration")
-            by_artist = track.get("byArtist")
-            track_artist = by_artist.get("name") if isinstance(by_artist, dict) else None
+        """Extract the tracklist from JSON-LD itemListElement entries.
 
-            recording_of = track.get("recordingOf", {})
-            lyrics_obj = recording_of.get("lyrics", {}) if isinstance(recording_of, dict) else {}
-            lyrics = lyrics_obj.get("text") if isinstance(lyrics_obj, dict) else None
+        Track pages are ``MusicRecording`` and carry no itemListElement: they
+        describe one recording, so the tracklist is that single track. Without
+        this fallback, opening a ``/track/`` URL yields an empty tracklist.
+        """
+        track_list = data.get("track")
+        entries = track_list.get("itemListElement", []) if isinstance(track_list, dict) else []
+        if entries:
+            return [
+                self._parse_track(entry.get("item", {}), album_id, entry.get("position")) for entry in entries
+            ]
+        if data.get("@type") == "MusicRecording":
+            return [self._parse_track(data, album_id, None)]
+        return []
 
-            tracks.append(
-                {
-                    "_type": "track",
-                    "track_id": find_property(track.get("additionalProperty", []), "track_id"),
-                    "album_id": album_id,
-                    "position": entry.get("position"),
-                    "title": track.get("name"),
-                    "track_url": track.get("@id"),
-                    "artist": track_artist,
-                    "duration": format_track_time(duration_raw),
-                    "duration_raw": duration_raw,
-                    "lyrics": lyrics,
-                }
-            )
-        return tracks
+    @staticmethod
+    def _parse_track(track: dict, album_id: str | None, position) -> dict:
+        """Build one track dict from a JSON-LD recording node."""
+        duration_raw = track.get("duration")
+        by_artist = track.get("byArtist")
+        track_artist = by_artist.get("name") if isinstance(by_artist, dict) else None
+
+        recording_of = track.get("recordingOf", {})
+        lyrics_obj = recording_of.get("lyrics", {}) if isinstance(recording_of, dict) else {}
+        lyrics = lyrics_obj.get("text") if isinstance(lyrics_obj, dict) else None
+
+        properties = track.get("additionalProperty", [])
+        if position is None:
+            # Track pages carry the number as a property instead of a position.
+            position = find_property(properties, "tracknum")
+
+        return {
+            "_type": "track",
+            "track_id": find_property(properties, "track_id"),
+            "album_id": album_id,
+            "position": position,
+            "title": track.get("name"),
+            "track_url": strip_tracker(track.get("@id")),
+            "artist": track_artist,
+            "duration": format_track_time(duration_raw),
+            "duration_raw": duration_raw,
+            "lyrics": lyrics,
+        }
 
 
 class ArtistPageParser(BasePageParser):
@@ -309,7 +347,8 @@ class ArtistPageParser(BasePageParser):
                     "title": title,
                     "artist_name": artist_name,
                     "item_type": item_type,
-                    "url": urljoin(self.url, link.get("href", "")),
+                    # Label grids link with a ?label=...&tab=music referrer.
+                    "url": strip_tracker(urljoin(self.url, link.get("href", ""))),
                     "art_url": artwork_url,
                 }
             )
@@ -328,122 +367,9 @@ class ArtistPageParser(BasePageParser):
                         "title": entry.get("title", ""),
                         "artist_name": entry.get("artist"),
                         "item_type": entry.get("type"),
-                        "url": urljoin(self.url, entry.get("page_url", "")),
+                        "url": strip_tracker(urljoin(self.url, entry.get("page_url", ""))),
                         "art_url": None,
                     }
                 )
 
         return items
-
-
-# Maps Bandcamp search type codes to entity types
-_SEARCH_TYPE_MAP = {"b": "artist", "a": "album", "t": "track"}
-
-
-class SearchPageParser(BasePageParser):
-    """Parse a Bandcamp search results page.
-
-    Extracts search results from ``ul.result-items > li.searchresult`` items
-    and pagination info from ``div.pager_controls``.
-    """
-
-    def parse(self) -> dict | None:
-        results = self._parse_results()
-        has_more = self._has_next_page()
-        return {"results": results, "has_more": has_more}
-
-    def _parse_results(self) -> list[dict]:
-        """Extract all search result items from the page."""
-        items = []
-        for result_item in self.soup.select("li.searchresult"):
-            result = self._parse_result(result_item)
-            if result:
-                items.append(result)
-        return items
-
-    def _parse_result(self, result_item) -> dict | None:
-        """Parse a single search result ``<li>`` element."""
-        # Type and ID from data-search attribute
-        data_search = result_item.get("data-search", "")
-        try:
-            search_data = json.loads(data_search)
-        except (json.JSONDecodeError, TypeError):
-            return None
-
-        entity_type = _SEARCH_TYPE_MAP.get(search_data.get("type"))
-        if not entity_type:
-            return None
-
-        # Name from .heading a
-        heading = result_item.select_one(".heading a")
-        name = clean_text(heading.get_text()) if heading else ""
-
-        # Clean URL from .itemurl a (strips tracking params)
-        url = ""
-        url_el = result_item.select_one(".itemurl a")
-        if url_el:
-            url = clean_text(url_el.get_text())
-
-        # Subhead: location for bands, "by Artist" for albums/tracks
-        subhead = ""
-        subhead_el = result_item.select_one(".subhead")
-        if subhead_el:
-            subhead = clean_text(subhead_el.get_text())
-
-        # Genre
-        genre = ""
-        genre_el = result_item.select_one(".genre")
-        if genre_el:
-            genre = clean_text(genre_el.get_text())
-            # Strip "genre : " prefix (localized, uses &nbsp;)
-            if ":" in genre:
-                genre = genre.split(":", 1)[1].strip()
-
-        # Tags
-        tags = []
-        tags_el = result_item.select_one(".tags")
-        if tags_el:
-            tags_text = clean_text(tags_el.get_text())
-            if ":" in tags_text:
-                tags_text = tags_text.split(":", 1)[1].strip()
-            tags = parse_tags(tags_text)
-
-        # Image URL from .art img
-        img_el = result_item.select_one(".art img")
-        image_url = img_el.get("src") if img_el else None
-
-        # Build result, normalize fields to match entity definitions
-        result = {"_type": entity_type, "url": url, "genre": genre, "tags": tags, "image_url": image_url}
-
-        if entity_type == "artist":
-            result["name"] = name
-            result["location"] = subhead
-        elif entity_type == "album":
-            result["title"] = name
-            result["artist_name"] = subhead[3:].strip() if subhead.lower().startswith("by ") else subhead
-        elif entity_type == "track":
-            result["title"] = name
-            # subhead is "from Album by Artist" or "by Artist"
-            if " by " in subhead:
-                result["artist"] = subhead.rsplit(" by ", 1)[1].strip()
-            elif subhead.lower().startswith("by "):
-                result["artist"] = subhead[3:].strip()
-
-        return result
-
-    def _has_next_page(self) -> bool:
-        """Check if there is a next page link in the pager controls."""
-        # Current page is a <span>, next pages are <a> elements
-        pager = self.soup.select_one(".pager_controls")
-        if not pager:
-            return False
-        chosen = pager.select_one("span.pagenum.chosen")
-        if not chosen:
-            return False
-        # If there's any <a.pagenum> after the current page, there's more
-        next_link = chosen.find_parent("li")
-        if next_link:
-            next_sibling = next_link.find_next_sibling("li")
-            if next_sibling and next_sibling.find("a", class_="pagenum"):
-                return True
-        return False

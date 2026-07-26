@@ -4,31 +4,31 @@ Each entity type (album, artist, discover, search) has a dedicated API class.
 All data is returned as plain dicts with a ``_type`` discriminator key.
 """
 
-from collections.abc import Callable
 from typing import Literal
 
 from bs4 import BeautifulSoup
 from loguru import logger
 
-from .client import BandcampClient
-from .parsers import AlbumPageParser, ArtistPageParser, SearchPageParser
-from .utils import art_url
+from .client import BandcampClient, NotFoundError
+from .parsers import AlbumPageParser, ArtistPageParser
+from .utils import art_url, parse_tags, strip_tracker
 
-DIG_DEEPER_URL = "https://bandcamp.com/api/hub/2/dig_deeper"
 DISCOVER_WEB_URL = "https://bandcamp.com/api/discover/1/discover_web"
-SEARCH_URL = "https://bandcamp.com/search"
+SEARCH_URL = "https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic"
 
 Slice = Literal["new", "top", "rand"]
 ItemType = Literal["all", "band", "album", "track"]
-Sort = Literal["date", "pop", "top"]
 
-# Maps CLI filter flags to Bandcamp item_type query parameter values
+# Maps CLI filter flags to the endpoint's search_filter values
 SEARCH_ITEM_TYPES: dict[ItemType, str] = {
     "all": "",
     "band": "b",
     "album": "a",
     "track": "t",
 }
+
+# Maps the endpoint's result type codes to our entity types
+_SEARCH_TYPE_MAP = {"b": "artist", "a": "album", "t": "track"}
 
 
 class BaseAPI:
@@ -56,30 +56,6 @@ class BaseAPI:
         if image:
             entity["_art_data"] = self._client.get_bytes(image)
 
-    def _paginate(
-        self,
-        fetch_page: Callable[[int], tuple[list[dict], bool]],
-        max_pages: int,
-        label: str,
-    ) -> list[dict]:
-        """Accumulate pages from a ``(page) -> (items, has_more)`` fetcher.
-
-        Stops when ``has_more`` is False, the page is empty, or
-        ``max_pages`` is reached. Crawl delay is applied by the client
-        on each call.
-        """
-        all_results: list[dict] = []
-        pages_fetched = 0
-        for page in range(1, max_pages + 1):
-            results, has_more = fetch_page(page)
-            all_results.extend(results)
-            pages_fetched = page
-            logger.debug(f"Page {page}: {len(results)} {label}")
-            if not has_more or not results:
-                break
-        logger.info(f"Discovered {len(all_results)} {label} across {pages_fetched} pages.")
-        return all_results
-
 
 class AlbumAPI(BaseAPI):
     """Fetch and parse Bandcamp album pages."""
@@ -97,93 +73,6 @@ class AlbumAPI(BaseAPI):
         if fetch_art:
             self._attach_image(album)
         return album
-
-
-class DiscoverAPI(BaseAPI):
-    """Browse Bandcamp releases via the legacy ``dig_deeper`` hub endpoint.
-
-    Caps around ~600 items per tag and returns a leaner payload (no inline
-    ``release_date``, ``location``, ``track_count``, etc.). Prefer
-    :class:`DiscoverWebAPI` for new work.
-    """
-
-    def discover(
-        self,
-        tags: list,
-        sort: Sort = "date",
-        page: int = 1,
-        media_format: str = "all",
-    ) -> tuple[list[dict], bool]:
-        """Fetch a single page of releases.
-
-        Args:
-            tags: Genre and/or location tags. Country tag_ids should be
-                appended to this list for location filtering
-                (e.g. ``["dungeon-synth", 1309675381]``).
-            sort: Sort mode (one of "date", "pop", "top").
-            page: Page number (1-indexed).
-            media_format: Format filter (default "all").
-
-        Returns:
-            Tuple of (list of release_summary dicts, has_more).
-        """
-        payload = {
-            "filters": {
-                "tags": tags,
-                "format": media_format,
-                "location": 0,
-                "sort": sort,
-            },
-            "page": page,
-        }
-
-        data = self._client.post_json(DIG_DEEPER_URL, payload, crawl=True)
-        if not data:
-            return [], False
-
-        items = data.get("items", [])
-        results = []
-        for item in items:
-            art_id = item.get("art_id")
-            results.append(
-                {
-                    "_type": "album",
-                    "album_id": item.get("tralbum_id"),
-                    "artist_name": item.get("artist"),
-                    "title": item.get("title"),
-                    "url": item.get("tralbum_url"),
-                    "artist_url": item.get("band_url"),
-                    "artist_id": item.get("band_id"),
-                    "art_id": str(art_id) if art_id else None,
-                    "genre": item.get("genre", ""),
-                }
-            )
-
-        return results, data.get("more_available", False)
-
-    def discover_all(
-        self,
-        tags: list,
-        sort: Sort = "date",
-        max_pages: int = 10,
-    ) -> list[dict]:
-        """Fetch multiple pages of releases and combine them.
-
-        Keeps fetching until there are no more results or ``max_pages``
-        is reached. Crawl delay is applied between pages.
-        """
-        return self._paginate(
-            lambda page: self.discover(tags=tags, sort=sort, page=page),
-            max_pages=max_pages,
-            label="releases",
-        )
-
-
-def _strip_tracker(url: str | None) -> str | None:
-    """Remove the ``?from=discover_page`` tracker param Bandcamp appends."""
-    if not url:
-        return url
-    return url.split("?from=")[0]
 
 
 class _PageFetcherState:
@@ -205,14 +94,15 @@ class _PageFetcherState:
 
 
 class DiscoverWebAPI(BaseAPI):
-    """Browse Bandcamp releases via the new ``/discover`` page endpoint.
+    """Browse Bandcamp releases via the ``/discover`` page endpoint.
 
     Mirrors what the public ``https://bandcamp.com/discover/<tag>?s=<slice>``
-    page shows. Returns a broader set of releases than :class:`DiscoverAPI`
-    (which uses the older ``dig_deeper`` hub), and carries extra fields
-    inline (``release_date``, ``location``, ``price``, ``track_count``).
+    page shows, carrying ``release_date``, ``location``, ``price`` and
+    ``track_count`` inline.
 
-    Pagination is cursor-based, not page-based.
+    This replaced the older ``dig_deeper`` hub endpoint, which Bandcamp has
+    since removed (it now answers ``{"error": true, "error_message": "bad
+    function"}``). Pagination is cursor-based, not page-based.
     """
 
     def discover(
@@ -274,8 +164,8 @@ class DiscoverWebAPI(BaseAPI):
                     "artist_name": item.get("band_name"),
                     "album_artist": item.get("album_artist"),
                     "title": item.get("title"),
-                    "url": _strip_tracker(item.get("item_url")),
-                    "artist_url": _strip_tracker(item.get("band_url")),
+                    "url": strip_tracker(item.get("item_url")),
+                    "artist_url": strip_tracker(item.get("band_url")),
                     "artist_id": str(band_id) if band_id else None,
                     "art_id": str(art_id) if art_id else None,
                     "genre": "",
@@ -365,35 +255,85 @@ class DiscoverWebAPI(BaseAPI):
         return fetch
 
 
-class SearchAPI(BaseAPI):
-    """Search Bandcamp via the HTML search page."""
+def _search_result(item: dict) -> dict | None:
+    """Map one raw search hit onto the entity shape the display layer expects."""
+    entity_type = _SEARCH_TYPE_MAP.get(item.get("type"))
+    if not entity_type:
+        return None
 
-    def search(
-        self,
-        query: str,
-        page: int = 1,
-        item_type: ItemType = "all",
-    ) -> tuple[list[dict], bool]:
-        """Search Bandcamp and return one page of results.
+    item_id = item.get("id")
+    band_id = item.get("band_id")
+    art_id = item.get("art_id")
+
+    result = {
+        "_type": entity_type,
+        # Bands carry only a root URL; albums and tracks carry a full path.
+        "url": strip_tracker(item.get("item_url_path") or item.get("item_url_root")),
+        "genre": item.get("genre_name") or "",
+        "tags": parse_tags(item.get("tag_names")),
+        "image_url": item.get("img") or None,
+        "art_id": str(art_id) if art_id else None,
+    }
+
+    if entity_type == "artist":
+        result["artist_id"] = str(item_id) if item_id else None
+        result["name"] = item.get("name")
+        result["location"] = item.get("location")
+        result["is_label"] = item.get("is_label")
+    elif entity_type == "album":
+        result["album_id"] = str(item_id) if item_id else None
+        result["artist_id"] = str(band_id) if band_id else None
+        result["title"] = item.get("name")
+        result["artist_name"] = item.get("band_name")
+    else:
+        album_id = item.get("album_id")
+        result["track_id"] = str(item_id) if item_id else None
+        result["album_id"] = str(album_id) if album_id else None
+        result["artist_id"] = str(band_id) if band_id else None
+        result["title"] = item.get("name")
+        result["artist"] = item.get("band_name")
+        result["album_name"] = item.get("album_name")
+
+    return result
+
+
+class SearchAPI(BaseAPI):
+    """Search Bandcamp via the site's own search JSON endpoint.
+
+    The HTML search page at ``/search`` is fronted by a bot-defence
+    interstitial that answers HTTP 200 with no results in it, so scraping it
+    silently returns nothing. This endpoint is what the site's own search box
+    calls, and it is not gated.
+
+    It returns the full result set in one response with no cursor or offset,
+    so there is no pagination to expose.
+    """
+
+    def search(self, query: str, item_type: ItemType = "all") -> list[dict]:
+        """Search Bandcamp and return all results in one call.
 
         Args:
             query: Free-text search query.
-            page: Page number (1-indexed).
             item_type: Filter by type (one of "all", "band", "album", "track").
 
         Returns:
-            Tuple of (list of search_result dicts, has_more).
+            List of entity dicts (artist, album, and/or track).
         """
-        params = {"q": query, "page": page}
-        type_code = SEARCH_ITEM_TYPES.get(item_type, "")
-        if type_code:
-            params["item_type"] = type_code
+        payload = {
+            "search_text": query,
+            "search_filter": SEARCH_ITEM_TYPES.get(item_type, ""),
+            "full_page": True,
+            "fan_id": None,
+        }
 
-        data = self._get_page(SEARCH_URL, SearchPageParser, params=params)
+        data = self._client.post_json(SEARCH_URL, payload)
         if not data:
-            return [], False
+            return []
 
-        return data.get("results", []), data.get("has_more", False)
+        items = (data.get("auto") or {}).get("results") or []
+        results = [mapped for item in items if (mapped := _search_result(item))]
+        logger.debug(f"Search '{query}' ({item_type}): {len(results)} results")
+        return results
 
 
 class ArtistAPI(BaseAPI):
@@ -405,6 +345,9 @@ class ArtistAPI(BaseAPI):
         Fetches the root page for profile info, then the ``/music`` subpage
         for the discography grid. Skip the artist-photo download by
         passing ``fetch_art=False``.
+
+        A 404 on the root page propagates as ``NotFoundError`` so callers can
+        tell a deleted artist from a failed fetch.
         """
         artist = self._get_page(artist_url, ArtistPageParser)
         if not artist:
@@ -413,10 +356,28 @@ class ArtistAPI(BaseAPI):
         if fetch_art:
             self._attach_image(artist)
 
-        # Discography lives on /music subpage
-        music_url = artist_url.rstrip("/") + "/music"
-        music_page = self._get_page(music_url, ArtistPageParser, discography_only=True)
-        if music_page and music_page.get("discography"):
-            artist["discography"] = music_page["discography"]
+        discography = self._fetch_discography(artist_url)
+        if discography:
+            artist["discography"] = discography
 
         return artist
+
+    def _fetch_discography(self, artist_url: str) -> list[dict]:
+        """Fetch the ``/music`` subpage discography, or [] if unavailable.
+
+        This page is supplementary: the root page already yielded the profile.
+        A 404 here (``/music/music`` when the caller passed a ``/music`` URL,
+        or an artist with no music page) must not fail the whole artist, and
+        above all must not surface as ``NotFoundError`` -- callers read that as
+        "this artist is deleted" and would flag a live one.
+        """
+        base = artist_url.rstrip("/")
+        music_url = base if base.endswith("/music") else base + "/music"
+        try:
+            music_page = self._get_page(music_url, ArtistPageParser, discography_only=True)
+        except NotFoundError:
+            logger.debug(f"No /music subpage for {artist_url}")
+            return []
+        if not music_page:
+            return []
+        return music_page.get("discography") or []

@@ -108,6 +108,7 @@ Press `0` to go back, `Ctrl+C` to quit.
 
 ```bash
 bandcamp "erang" --artist --json            # output as JSON
+bandcamp "erang" --limit 10                 # cap results
 bandcamp --tag dungeon-synth --json --limit 100   # cap tag dump
 bandcamp https://erang.bandcamp.com/album/tome-iv --json
 bandcamp https://erang.bandcamp.com/album/tome-iv --full   # all sections at once
@@ -128,12 +129,12 @@ pipelines, or other tools. All data is returned as plain dicts with a
 ```python
 from bandcamp_explorer.core import (
     BandcampClient, AlbumAPI, ArtistAPI, DiscoverWebAPI, SearchAPI,
-    resolve_geoname,
+    NotFoundError, resolve_geoname,
 )
 
 with BandcampClient() as client:
-    # Search
-    results, has_more = SearchAPI(client).search("caladan brood", item_type="album")
+    # Search (one call returns the whole result set)
+    results = SearchAPI(client).search("caladan brood", item_type="album")
 
     # Discover releases by tag (new discover_web endpoint)
     discover = DiscoverWebAPI(client)
@@ -158,11 +159,32 @@ with BandcampClient() as client:
     client.download_image(album.get("image_url"), output_dir="./images/")
 ```
 
-> The legacy `DiscoverAPI` (the older `dig_deeper` hub endpoint) and
-> `resolve_location` (location-tag resolver) are still exported for
-> callers that specifically need them, but `DiscoverWebAPI` returns a
-> broader feed with richer inline fields (`release_date`, `location`,
-> `duration`, `price`, ...) and is the recommended entry point.
+### Errors
+
+`AlbumAPI.get` and `ArtistAPI.get` raise `NotFoundError` when a page 404s, so
+callers can tell a deleted release from a failed fetch. Every other transport
+failure returns `None`. If Bandcamp answers with its bot-defence interstitial
+(HTTP 200 with no content in it), the client raises `ChallengeError` and then
+fails fast for two minutes rather than hammering a blocked endpoint. Never
+treat a `ChallengeError` as a missing resource; it means "ask again later".
+
+```python
+from bandcamp_explorer.core import ChallengeError, NotFoundError
+
+try:
+    album = AlbumAPI(client).get(url)
+except NotFoundError:
+    ...  # gone for good, stop retrying
+except ChallengeError:
+    ...  # blocked for now, retry later
+```
+
+> `resolve_location` (the older location-tag resolver, used by the
+> `/discover/<slug>` pages) is still exported for callers that need tag IDs,
+> but `resolve_geoname` is what `DiscoverWebAPI` takes.
+>
+> The `dig_deeper` hub endpoint that `DiscoverAPI` wrapped has been removed by
+> Bandcamp and the class was dropped in 0.6.0. Use `DiscoverWebAPI`.
 
 ## License
 
