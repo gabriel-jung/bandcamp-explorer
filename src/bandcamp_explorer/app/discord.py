@@ -69,6 +69,7 @@ track_def = EntityDef(
     ],
     header_fields=[
         HeaderField("Artist", key="artist"),
+        HeaderField("Album", key="album_name"),
         HeaderField("Duration", key="duration"),
         HeaderField("Track", key="position", transform=lambda v: str(v) if v else ""),
     ],
@@ -150,6 +151,7 @@ artist_def = EntityDef(
     ],
     header_fields=[
         HeaderField("Location", key="location"),
+        HeaderField("Type", transform=lambda d: "Label" if d.get("is_label") else ""),
         HeaderField("Label", key="label"),
     ],
     thumbnail_url_key="image_url",
@@ -185,6 +187,9 @@ def _build_bot() -> tuple[MetadataBot, BandcampClient, DiscoverWebAPI]:
     client = BandcampClient()
     apis = {
         "album": SyncAPI(AlbumFetcher(client, fetch_art=False, lyrics_as_text=True)),
+        # Track search results carry a /track/ URL that parses as an album
+        # entity; tracklist items have no "url" key and still render inline.
+        "track": SyncAPI(AlbumFetcher(client, fetch_art=False, lyrics_as_text=True)),
         "artist": SyncAPI(ArtistFetcher(client, fetch_art=False)),
         "search": SyncAPI(SearchAdapter(client)),
         "album_search": SyncAPI(SearchAdapter(client, "album")),

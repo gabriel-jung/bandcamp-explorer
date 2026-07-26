@@ -2,7 +2,7 @@
 
 from .api import AlbumAPI, ArtistAPI, DiscoverWebAPI, SearchAPI
 from .client import BandcampClient, ChallengeError, NotFoundError
-from .countries import resolve_geoname, resolve_location
+from .countries import resolve_geoname
 
 __all__ = [
     "AlbumAPI",
@@ -13,5 +13,4 @@ __all__ = [
     "DiscoverWebAPI",
     "SearchAPI",
     "resolve_geoname",
-    "resolve_location",
 ]

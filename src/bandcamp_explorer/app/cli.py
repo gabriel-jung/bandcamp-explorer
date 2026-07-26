@@ -81,6 +81,7 @@ track_def = EntityDef(
     header_title=lambda d: f"[bold]{d.get('title', '')}[/bold]",
     header_fields=[
         HeaderField("Artist", key="artist"),
+        HeaderField("Album", key="album_name"),
         HeaderField("Duration", key="duration"),
         HeaderField("Track", key="position", transform=lambda v: str(v) if v else ""),
     ],
@@ -175,6 +176,7 @@ artist_def = EntityDef(
     header_image_key="_art_data",
     header_fields=[
         HeaderField("Location", key="location"),
+        HeaderField("Type", transform=lambda d: "Label" if d.get("is_label") else ""),
         HeaderField("Label", key="label"),
         HeaderField("URL", key="url"),
     ],
@@ -212,6 +214,10 @@ def _make_navigator(client: BandcampClient) -> BaseNavigator:
     """Create a navigator wired to all Bandcamp APIs."""
     apis = {
         "album": AlbumFetcher(client),
+        # Track search results carry a /track/ URL, which parses as an album
+        # entity flagged is_track. Items inside an album's tracklist have no
+        # "url" key, so they still render inline without a fetch.
+        "track": AlbumFetcher(client),
         "artist": ArtistFetcher(client),
         "search": SearchAPI(client),
         "discover": DiscoverWebAPI(client),

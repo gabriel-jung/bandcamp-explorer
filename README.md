@@ -179,12 +179,11 @@ except ChallengeError:
     ...  # blocked for now, retry later
 ```
 
-> `resolve_location` (the older location-tag resolver, used by the
-> `/discover/<slug>` pages) is still exported for callers that need tag IDs,
-> but `resolve_geoname` is what `DiscoverWebAPI` takes.
->
-> The `dig_deeper` hub endpoint that `DiscoverAPI` wrapped has been removed by
-> Bandcamp and the class was dropped in 0.6.0. Use `DiscoverWebAPI`.
+> Bandcamp removed the `dig_deeper` hub endpoint, so `DiscoverAPI` was dropped
+> in 0.6.0; use `DiscoverWebAPI`. `resolve_location` went with it: it resolved
+> Bandcamp's internal location *tag* ids, which only that endpoint accepted.
+> `DiscoverWebAPI` filters by `geoname_id`, so `resolve_geoname` is the one you
+> want.
 
 ## License
 

@@ -342,9 +342,12 @@ class ArtistAPI(BaseAPI):
     def get(self, artist_url: str, fetch_art: bool = True) -> dict | None:
         """Fetch an artist page and return parsed data.
 
-        Fetches the root page for profile info, then the ``/music`` subpage
-        for the discography grid. Skip the artist-photo download by
-        passing ``fetch_art=False``.
+        Fetches the root page for profile info. Most artist pages already
+        render the same music grid as ``/music``, including the overflow items
+        held in ``data-client-items``, so the subpage is only fetched when the
+        root turned up no discography (typically an artist whose landing page
+        is a single release rather than a grid). Skip the artist-photo download
+        by passing ``fetch_art=False``.
 
         A 404 on the root page propagates as ``NotFoundError`` so callers can
         tell a deleted artist from a failed fetch.
@@ -356,9 +359,8 @@ class ArtistAPI(BaseAPI):
         if fetch_art:
             self._attach_image(artist)
 
-        discography = self._fetch_discography(artist_url)
-        if discography:
-            artist["discography"] = discography
+        if not artist.get("discography"):
+            artist["discography"] = self._fetch_discography(artist_url)
 
         return artist
 
