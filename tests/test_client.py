@@ -155,12 +155,38 @@ def test_fallback_targets_curl_cffi_does_not_know_are_skipped():
     assert client.get("https://x.bandcamp.com/album/a") == "the real page"
 
 
-def test_a_challenge_on_the_fallback_is_not_reported_as_a_404():
+def test_a_challenged_fallback_is_skipped_for_the_next_one():
     FakeSession.responses = {
         "chrome": [FakeResponse(404)],
+        "chrome131": [FakeResponse(200, CHALLENGE_BODY)],
+        "chrome124": [FakeResponse(200, "the real page")],
+    }
+    client = make_client(fallback_impersonate=("chrome131", "chrome124"))
+
+    assert client.get("https://x.bandcamp.com/album/a") == "the real page"
+    assert client.impersonate == "chrome124"
+
+
+def test_a_challenged_fallback_does_not_arm_the_backoff_on_the_primary():
+    """A throwaway fallback session being challenged says nothing about the
+    primary. Arming the shared backoff there would turn every genuine 404 into
+    a two-minute stall for the whole client."""
+    FakeSession.responses = {
+        "chrome": [FakeResponse(404), FakeResponse(200, "a later page")],
         "chrome124": [FakeResponse(200, CHALLENGE_BODY)],
     }
     client = make_client(fallback_impersonate=("chrome124",))
+
+    with pytest.raises(NotFoundError):
+        client.get("https://x.bandcamp.com/album/gone")
+
+    assert client.impersonate == "chrome"
+    assert client.get("https://x.bandcamp.com/album/b") == "a later page"
+
+
+def test_a_challenge_on_the_primary_still_raises():
+    FakeSession.responses = {"chrome": [FakeResponse(200, CHALLENGE_BODY)]}
+    client = make_client()
 
     with pytest.raises(ChallengeError):
         client.get("https://x.bandcamp.com/album/a")

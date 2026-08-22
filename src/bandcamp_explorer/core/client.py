@@ -253,16 +253,24 @@ class BandcampClient:
                 except _HTTP_EXCEPTIONS as e:
                     logger.error(f"Fallback GET on {name} failed for {url}: {e}")
                     continue
-                # Before promoting: a session serving the interstitial is not a
-                # working fingerprint, and this must surface as ChallengeError
-                # rather than ride out as a rescued body.
-                self._check_challenge(text, url)
+                # A throwaway fallback session being challenged is not evidence
+                # about the primary, so it must not arm the shared backoff: that
+                # would turn every genuine 404 into a two-minute stall for the
+                # whole client. Skip this fingerprint, keep asking the others.
+                if _is_challenge(text):
+                    logger.warning(f"Fallback {name} was challenged for {url}; trying the next one.")
+                    continue
                 self._promote(name, session, url)
                 promoted = True
                 return text
             finally:
                 if not promoted:
                     session.close()
+        if self._fallback_impersonate:
+            logger.warning(
+                f"404 on {url} could not be corroborated: no fallback fingerprint "
+                f"served the page. Treating it as gone."
+            )
         return None
 
     def _promote(self, name: str, session, url: str) -> None:

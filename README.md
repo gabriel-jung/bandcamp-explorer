@@ -200,7 +200,15 @@ client.impersonate  # the fingerprint currently in use, after any promotion
 ```
 
 Names come from curl_cffi's impersonate targets; entries the installed version
-does not know are skipped rather than raising.
+does not know are skipped rather than raising. Which fingerprints are blocked
+varies by vantage point, so treat the default list as a starting guess and
+measure from the host that will run the fetches.
+
+The ladder only ever refuses to believe a 404, it never invents one. A fallback
+that errors, is challenged, or is unknown proves nothing, so it is skipped and
+the original 404 stands (logged as uncorroborated). A challenged *fallback*
+never arms the client's challenge backoff either: that session is a throwaway
+and says nothing about the primary.
 
 > Bandcamp removed the `dig_deeper` hub endpoint, so `DiscoverAPI` was dropped
 > in 0.6.0; use `DiscoverWebAPI`. `resolve_location` went with it: it resolved
