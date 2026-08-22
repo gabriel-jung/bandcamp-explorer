@@ -19,6 +19,33 @@ _CHALLENGE_SCAN_BYTES = 8192
 
 CHALLENGE_BACKOFF_SECONDS = 120.0
 
+# curl_cffi's "chrome" alias floats to the newest build it ships. Bandcamp has
+# been soft-blocking the recent ones since 2026-08-12: they answer HTTP 404 to
+# album pages that older fingerprints fetch fine. Upgrading curl_cffi only moves
+# the alias further into the blocked range, so a 404 has to be re-checked on a
+# known-good fingerprint before it can be believed.
+DEFAULT_IMPERSONATE = "chrome"
+FALLBACK_IMPERSONATE = ("chrome131", "chrome124")
+
+
+def _known_impersonate_targets() -> frozenset[str]:
+    """Names the installed curl_cffi accepts, or an empty set if unknowable.
+
+    The fallback list is pinned in source while curl_cffi drops old targets as
+    it moves forward, so a name here can outlive the build that understands it.
+    Filtering against this keeps a stale entry from turning every fallback into
+    a ``ValueError`` at the exact moment the ladder is needed. An empty set
+    means "could not tell", and the list is then used unfiltered.
+    """
+    try:
+        from typing import get_args
+
+        from curl_cffi.requests.impersonate import BrowserTypeLiteral
+
+        return frozenset(get_args(BrowserTypeLiteral))
+    except Exception:
+        return frozenset()
+
 
 class NotFoundError(Exception):
     """Raised when a resource returns HTTP 404.
@@ -61,19 +88,54 @@ class BandcampClient:
     Discord command handler, which cannot block for two minutes.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        impersonate: str = DEFAULT_IMPERSONATE,
+        fallback_impersonate: tuple[str, ...] = FALLBACK_IMPERSONATE,
+    ):
+        """Build a client on a chosen TLS fingerprint.
+
+        Args:
+            impersonate: curl_cffi impersonate target for the session. Defaults
+                to the floating ``"chrome"`` alias.
+            fallback_impersonate: fingerprints to re-check a 404 against, tried
+                in order. Pass ``()`` to disable the ladder and let every 404
+                raise immediately.
+        """
         self.rate_limit_seconds = 1.0
         self.crawl_delay = 5.0
         self._last_request_time = None
         self._challenge_until = 0.0
-        self._session = curl_requests.Session(impersonate="chrome")
-        logger.debug("HTTP client initialized.")
+        self.impersonate = impersonate
+        self._fallback_impersonate = self._usable_fallbacks(impersonate, fallback_impersonate)
+        self._session = curl_requests.Session(impersonate=impersonate)
+        logger.debug(f"HTTP client initialized on {impersonate}.")
+
+    @staticmethod
+    def _usable_fallbacks(impersonate: str, candidates: tuple[str, ...]) -> tuple[str, ...]:
+        """Drop the primary fingerprint and anything curl_cffi cannot build."""
+        known = _known_impersonate_targets()
+        usable = []
+        for name in candidates:
+            if name == impersonate or name in usable:
+                continue
+            if known and name not in known:
+                logger.debug(f"Skipping fallback fingerprint {name}: unknown to curl_cffi.")
+                continue
+            usable.append(name)
+        return tuple(usable)
 
     def get(self, url: str, params: dict | None = None, crawl: bool = False) -> str | None:
         """GET request, return response text or None on failure.
 
-        Raises ``NotFoundError`` on 404 and ``ChallengeError`` on a bot-defence
-        response. Every other failure is logged and returns ``None``.
+        A 404 is re-checked against the fallback fingerprints before it is
+        believed, because Bandcamp soft-blocks some of them with a 404. If one
+        of them serves the page, that fingerprint takes over the session for
+        good and its body is returned.
+
+        Raises ``NotFoundError`` on a 404 no fingerprint could contradict, and
+        ``ChallengeError`` on a bot-defence response. Every other failure is
+        logged and returns ``None``.
         """
         self._guard_challenge_backoff(url)
         self._wait_between_requests(crawl=crawl)
@@ -84,6 +146,11 @@ class BandcampClient:
                 raise NotFoundError(url)
             response.raise_for_status()
             text = response.text
+        except NotFoundError:
+            rescued = self._retry_on_fallbacks(url, params, crawl)
+            if rescued is None:
+                raise
+            text = rescued
         except _HTTP_EXCEPTIONS as e:
             logger.error(f"GET failed for {url}: {e}")
             return None
@@ -161,6 +228,58 @@ class BandcampClient:
         except OSError as e:
             logger.debug(f"Failed to save {url}: {e}")
             return None
+
+    def _retry_on_fallbacks(self, url: str, params: dict | None, crawl: bool) -> str | None:
+        """Re-fetch a 404 on each fallback fingerprint, newest first.
+
+        Returns the body as soon as one of them serves the page, having first
+        promoted that fingerprint onto the session. Returns ``None`` when no
+        fallback contradicted the 404, which includes the inconclusive cases:
+        a transport error proves nothing, so the original 404 is left standing
+        rather than downgraded to a retry. This only ever refuses to believe a
+        404, it never invents one.
+        """
+        for name in self._fallback_impersonate:
+            self._wait_between_requests(crawl=crawl)
+            session = curl_requests.Session(impersonate=name)
+            promoted = False
+            try:
+                try:
+                    response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+                    if response.status_code == 404:
+                        continue
+                    response.raise_for_status()
+                    text = response.text
+                except _HTTP_EXCEPTIONS as e:
+                    logger.error(f"Fallback GET on {name} failed for {url}: {e}")
+                    continue
+                # Before promoting: a session serving the interstitial is not a
+                # working fingerprint, and this must surface as ChallengeError
+                # rather than ride out as a rescued body.
+                self._check_challenge(text, url)
+                self._promote(name, session, url)
+                promoted = True
+                return text
+            finally:
+                if not promoted:
+                    session.close()
+        return None
+
+    def _promote(self, name: str, session, url: str) -> None:
+        """Adopt a fallback fingerprint for the rest of this client's life.
+
+        A 404 on the primary that another fingerprint serves is proof the
+        primary is soft-blocked. Keeping the working one means the extra
+        request is paid once instead of on every later 404, and ``post_json``
+        (search, discover) rides the unblocked session too.
+        """
+        logger.warning(
+            f"Fingerprint {self.impersonate} looks soft-blocked: 404 on {url}, "
+            f"which {name} serves. Switching this client to {name}."
+        )
+        self._session.close()
+        self._session = session
+        self.impersonate = name
 
     def _guard_challenge_backoff(self, url: str) -> None:
         """Fail fast while a previously seen challenge is still cooling down."""

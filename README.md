@@ -179,6 +179,29 @@ except ChallengeError:
     ...  # blocked for now, retry later
 ```
 
+### TLS fingerprints
+
+Bandcamp soft-blocks some TLS fingerprints by answering **HTTP 404** to pages a
+different fingerprint fetches fine, so a bare 404 is not proof of deletion. The
+client re-checks every 404 against a short list of known-good fingerprints
+before raising `NotFoundError`. If one of them serves the page, that fingerprint
+takes over the session for the rest of the client's life, so the extra request
+is paid once rather than on every later 404.
+
+```python
+# Pick the fingerprint yourself (default: curl_cffi's floating "chrome" alias).
+client = BandcampClient(impersonate="chrome124")
+
+# Change or disable the re-check ladder.
+client = BandcampClient(fallback_impersonate=("chrome131", "chrome124"))
+client = BandcampClient(fallback_impersonate=())  # every 404 raises at once
+
+client.impersonate  # the fingerprint currently in use, after any promotion
+```
+
+Names come from curl_cffi's impersonate targets; entries the installed version
+does not know are skipped rather than raising.
+
 > Bandcamp removed the `dig_deeper` hub endpoint, so `DiscoverAPI` was dropped
 > in 0.6.0; use `DiscoverWebAPI`. `resolve_location` went with it: it resolved
 > Bandcamp's internal location *tag* ids, which only that endpoint accepted.
