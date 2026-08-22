@@ -201,8 +201,12 @@ client.impersonate  # the fingerprint currently in use, after any promotion
 
 Names come from curl_cffi's impersonate targets; entries the installed version
 does not know are skipped rather than raising. Which fingerprints are blocked
-varies by vantage point, so treat the default list as a starting guess and
-measure from the host that will run the fetches.
+varies by vantage point: two hosts can see the same cutoff between builds with
+the sides swapped, one serving the recent ones and challenging the old, the
+other the reverse. Measure from the machine that will run the fetches with
+`python scripts/probe_fingerprints.py`, which reads response bodies rather than
+status codes because a blocked fingerprint answers HTTP 200 with the
+interstitial.
 
 The ladder only ever refuses to believe a 404, it never invents one. A fallback
 that errors, is challenged, or is unknown proves nothing, so it is skipped and
