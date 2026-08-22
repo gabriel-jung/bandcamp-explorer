@@ -210,9 +210,30 @@ interstitial.
 
 The ladder only ever refuses to believe a 404, it never invents one. A fallback
 that errors, is challenged, or is unknown proves nothing, so it is skipped and
-the original 404 stands (logged as uncorroborated). A challenged *fallback*
-never arms the client's challenge backoff either: that session is a throwaway
-and says nothing about the primary.
+the original 404 stands. A challenged *fallback* never arms the client's
+challenge backoff either: that session is a throwaway and says nothing about
+the primary.
+
+`NotFoundError.confirmed_by` names the fallback fingerprints that independently
+saw the same 404. It is empty when nobody could check, which is much weaker
+evidence than a 404 two working fingerprints agreed on. Callers that flag rows
+deleted should require it:
+
+```python
+try:
+    album = AlbumAPI(client).get(url)
+except NotFoundError as e:
+    if e.confirmed_by:
+        mark_deleted(url)  # two independent fingerprints agree it is gone
+    else:
+        ...  # nothing could corroborate it; leave the row alone and retry
+```
+
+The default ladder deliberately spans browser families. Two Chrome builds share
+a failure axis: Bandcamp splits Chrome between 131 and 133a, and which side is
+served depends on where you fetch from, so a pair of Chrome fallbacks can land
+on the blocked side together and rescue nothing. Firefox and Safari are off that
+axis.
 
 > Bandcamp removed the `dig_deeper` hub endpoint, so `DiscoverAPI` was dropped
 > in 0.6.0; use `DiscoverWebAPI`. `resolve_location` went with it: it resolved

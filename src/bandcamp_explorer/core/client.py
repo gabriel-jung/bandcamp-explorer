@@ -25,7 +25,13 @@ CHALLENGE_BACKOFF_SECONDS = 120.0
 # the alias further into the blocked range, so a 404 has to be re-checked on a
 # known-good fingerprint before it can be believed.
 DEFAULT_IMPERSONATE = "chrome"
-FALLBACK_IMPERSONATE = ("chrome131", "chrome124")
+
+# Deliberately not two Chrome builds: they share a failure axis. Measured from
+# two vantage points, Bandcamp splits Chrome at the same place (131 and older
+# on one side, 133a and newer on the other) but serves opposite sides, so a
+# pair of Chrome fallbacks can land on the blocked side together and rescue
+# nothing. Firefox and Safari are off that axis entirely.
+FALLBACK_IMPERSONATE = ("chrome131", "firefox144", "safari184")
 
 
 def _known_impersonate_targets() -> frozenset[str]:
@@ -57,7 +63,18 @@ class NotFoundError(Exception):
     from a failed fetch: the scraping pipeline flags the former as deleted and
     retries the latter, and collapsing the two means dead pages are re-fetched
     forever. Keep this outside the request-exception hierarchy.
+
+    ``confirmed_by`` names the fallback fingerprints that independently saw the
+    same 404. Empty means nobody could check (every fallback was challenged or
+    errored, or the ladder is disabled), which is weaker evidence than a 404 two
+    working fingerprints agreed on. Callers that flag deleted rows should
+    require a non-empty ``confirmed_by`` and retry the rest later.
     """
+
+    def __init__(self, url: str, confirmed_by: tuple[str, ...] = ()):
+        super().__init__(url)
+        self.url = url
+        self.confirmed_by = confirmed_by
 
 
 class ChallengeError(Exception):
@@ -147,9 +164,9 @@ class BandcampClient:
             response.raise_for_status()
             text = response.text
         except NotFoundError:
-            rescued = self._retry_on_fallbacks(url, params, crawl)
+            rescued, confirmed_by = self._retry_on_fallbacks(url, params, crawl)
             if rescued is None:
-                raise
+                raise NotFoundError(url, confirmed_by)
             text = rescued
         except _HTTP_EXCEPTIONS as e:
             logger.error(f"GET failed for {url}: {e}")
@@ -229,16 +246,21 @@ class BandcampClient:
             logger.debug(f"Failed to save {url}: {e}")
             return None
 
-    def _retry_on_fallbacks(self, url: str, params: dict | None, crawl: bool) -> str | None:
+    def _retry_on_fallbacks(
+        self, url: str, params: dict | None, crawl: bool
+    ) -> tuple[str | None, tuple[str, ...]]:
         """Re-fetch a 404 on each fallback fingerprint, newest first.
 
-        Returns the body as soon as one of them serves the page, having first
-        promoted that fingerprint onto the session. Returns ``None`` when no
-        fallback contradicted the 404, which includes the inconclusive cases:
-        a transport error proves nothing, so the original 404 is left standing
-        rather than downgraded to a retry. This only ever refuses to believe a
-        404, it never invents one.
+        Returns ``(body, ())`` as soon as one of them serves the page, having
+        first promoted that fingerprint onto the session. Otherwise returns
+        ``(None, confirmed_by)``, where ``confirmed_by`` names the fingerprints
+        that saw the same 404. An empty tuple there means nobody could check,
+        not that the page is more certainly gone: a transport error or a
+        challenge proves nothing, so the original 404 is left standing rather
+        than downgraded to a retry. This only ever refuses to believe a 404, it
+        never invents one.
         """
+        confirmed_by: list[str] = []
         for name in self._fallback_impersonate:
             self._wait_between_requests(crawl=crawl)
             session = curl_requests.Session(impersonate=name)
@@ -247,6 +269,7 @@ class BandcampClient:
                 try:
                     response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
                     if response.status_code == 404:
+                        confirmed_by.append(name)
                         continue
                     response.raise_for_status()
                     text = response.text
@@ -262,16 +285,18 @@ class BandcampClient:
                     continue
                 self._promote(name, session, url)
                 promoted = True
-                return text
+                return text, ()
             finally:
                 if not promoted:
                     session.close()
-        if self._fallback_impersonate:
+        if confirmed_by:
+            logger.info(f"404 on {url} confirmed by {', '.join(confirmed_by)}.")
+        elif self._fallback_impersonate:
             logger.warning(
-                f"404 on {url} could not be corroborated: no fallback fingerprint "
-                f"served the page. Treating it as gone."
+                f"404 on {url} could not be checked: every fallback fingerprint was "
+                f"challenged or failed. Treating it as gone, but nothing corroborates it."
             )
-        return None
+        return None, tuple(confirmed_by)
 
     def _promote(self, name: str, session, url: str) -> None:
         """Adopt a fallback fingerprint for the rest of this client's life.

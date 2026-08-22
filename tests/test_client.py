@@ -12,7 +12,12 @@ from typing import ClassVar
 import pytest
 from curl_cffi import requests as curl_requests
 
-from bandcamp_explorer.core.client import BandcampClient, ChallengeError, NotFoundError
+from bandcamp_explorer.core.client import (
+    FALLBACK_IMPERSONATE,
+    BandcampClient,
+    ChallengeError,
+    NotFoundError,
+)
 
 CHALLENGE_BODY = "<html><head><title>Client Challenge</title></head></html>"
 
@@ -207,3 +212,55 @@ def test_a_transport_failure_on_the_fallback_leaves_the_404_standing():
 
 def test_not_found_error_stays_outside_the_request_exception_hierarchy():
     assert not issubclass(NotFoundError, curl_requests.exceptions.RequestException)
+
+
+def test_the_default_ladder_spans_more_than_one_browser_family():
+    """Two Chrome builds share a failure axis: when Bandcamp blocks a range of
+    Chrome builds, both fallbacks can land on the blocked side together and the
+    ladder rescues nothing. A non-Chrome fallback does not share that axis."""
+    families = {"".join(c for c in name if not c.isdigit()) for name in FALLBACK_IMPERSONATE}
+
+    assert len(families) > 1, f"all fallbacks share one family: {FALLBACK_IMPERSONATE}"
+
+
+def test_a_404_confirmed_by_a_fallback_says_which_one():
+    FakeSession.responses = {
+        "chrome": [FakeResponse(404)],
+        "chrome131": [FakeResponse(200, CHALLENGE_BODY)],
+        "firefox144": [FakeResponse(404)],
+        "safari184": [FakeResponse(404)],
+    }
+    client = make_client()
+
+    with pytest.raises(NotFoundError) as excinfo:
+        client.get("https://x.bandcamp.com/album/gone")
+
+    assert excinfo.value.confirmed_by == ("firefox144", "safari184")
+
+
+def test_an_unverifiable_404_names_no_confirming_fingerprint():
+    """Every fallback challenged means nobody could check, which is not the
+    same as a 404 two working fingerprints agreed on. Downstream needs the
+    difference to decide between marking a row deleted and retrying later."""
+    FakeSession.responses = {
+        "chrome": [FakeResponse(404)],
+        "chrome131": [FakeResponse(200, CHALLENGE_BODY)],
+        "firefox144": [FakeResponse(200, CHALLENGE_BODY)],
+        "safari184": [FakeResponse(200, CHALLENGE_BODY)],
+    }
+    client = make_client()
+
+    with pytest.raises(NotFoundError) as excinfo:
+        client.get("https://x.bandcamp.com/album/gone")
+
+    assert excinfo.value.confirmed_by == ()
+
+
+def test_a_404_with_the_ladder_disabled_confirms_nothing():
+    FakeSession.responses = {"chrome": [FakeResponse(404)]}
+    client = make_client(fallback_impersonate=())
+
+    with pytest.raises(NotFoundError) as excinfo:
+        client.get("https://x.bandcamp.com/album/gone")
+
+    assert excinfo.value.confirmed_by == ()
