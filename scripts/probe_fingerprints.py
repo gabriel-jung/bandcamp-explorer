@@ -1,11 +1,11 @@
 """Measure which curl_cffi fingerprints Bandcamp serves from THIS host.
 
-Which fingerprints are blocked depends on the vantage point, not just on the
-build: a machine can see the newest alias working and the older targets
-challenged while another sees the exact opposite. So the fallback ladder has
-to be chosen from the host that will run the fetches, never from a laptop.
+Which fingerprints are blocked depends on where the requests come from as much
+as on the build, and two hosts can see opposite sets. So the fallback ladder has
+to be measured from the machine that will run the fetches, not from a developer
+machine standing in for it.
 
-Run it on the scraping server:
+Run it there:
 
     uv run --with curl-cffi python scripts/probe_fingerprints.py
 

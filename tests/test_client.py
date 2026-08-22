@@ -14,6 +14,7 @@ from curl_cffi import requests as curl_requests
 
 from bandcamp_explorer.core.client import (
     FALLBACK_IMPERSONATE,
+    SUGGESTED_FALLBACK_IMPERSONATE,
     BandcampClient,
     ChallengeError,
     NotFoundError,
@@ -96,24 +97,21 @@ def test_a_404_is_rechecked_on_the_fallback_fingerprint():
     assert client.get("https://x.bandcamp.com/album/a") == "the real page"
 
 
-def test_a_fingerprint_that_answers_is_promoted_for_later_requests():
+def test_a_promoted_fingerprint_takes_over_and_the_blocked_one_is_closed():
     FakeSession.responses = {
-        "chrome": [FakeResponse(404)],
-        "chrome124": [FakeResponse(200, "first"), FakeResponse(200, "second")],
+        "chrome": [FakeResponse(404), FakeResponse(404)],
+        "chrome124": [FakeResponse(200, "first"), FakeResponse(200, "second"), FakeResponse(200, "third")],
     }
     client = make_client(fallback_impersonate=("chrome124",))
     blocked_session = client._session
 
     client.get("https://x.bandcamp.com/album/a")
     client.get("https://x.bandcamp.com/album/b")
+    client.get("https://x.bandcamp.com/album/c")
 
     assert client.impersonate == "chrome124"
     assert blocked_session.closed
-    assert FakeSession.calls == [
-        ("chrome", "https://x.bandcamp.com/album/a"),
-        ("chrome124", "https://x.bandcamp.com/album/a"),
-        ("chrome124", "https://x.bandcamp.com/album/b"),
-    ]
+    assert FakeSession.calls[-1] == ("chrome124", "https://x.bandcamp.com/album/c")
 
 
 def test_a_404_from_every_fingerprint_still_raises_not_found():
@@ -169,7 +167,6 @@ def test_a_challenged_fallback_is_skipped_for_the_next_one():
     client = make_client(fallback_impersonate=("chrome131", "chrome124"))
 
     assert client.get("https://x.bandcamp.com/album/a") == "the real page"
-    assert client.impersonate == "chrome124"
 
 
 def test_a_challenged_fallback_does_not_arm_the_backoff_on_the_primary():
@@ -214,13 +211,59 @@ def test_not_found_error_stays_outside_the_request_exception_hierarchy():
     assert not issubclass(NotFoundError, curl_requests.exceptions.RequestException)
 
 
-def test_the_default_ladder_spans_more_than_one_browser_family():
-    """Two Chrome builds share a failure axis: when Bandcamp blocks a range of
-    Chrome builds, both fallbacks can land on the blocked side together and the
-    ladder rescues nothing. A non-Chrome fallback does not share that axis."""
-    families = {"".join(c for c in name if not c.isdigit()) for name in FALLBACK_IMPERSONATE}
+def test_the_ladder_is_off_by_default():
+    """Nobody pays for the re-check unless they asked for it. The blocking it
+    guards against is environment specific, and with it on every genuine 404
+    costs an extra request per fallback."""
+    assert FALLBACK_IMPERSONATE == ()
+    assert make_client()._fallback_impersonate == ()
 
-    assert len(families) > 1, f"all fallbacks share one family: {FALLBACK_IMPERSONATE}"
+
+def test_the_default_makes_no_extra_request_on_a_404():
+    FakeSession.responses = {"chrome": [FakeResponse(404)]}
+    client = make_client()
+
+    with pytest.raises(NotFoundError):
+        client.get("https://x.bandcamp.com/album/gone")
+
+    assert FakeSession.calls == [("chrome", "https://x.bandcamp.com/album/gone")]
+
+
+def test_the_suggested_ladder_spans_more_than_one_browser_family():
+    """Two Chrome builds share a failure axis: a block that targets a range of
+    Chrome builds can catch both fallbacks at once, whichever side it hits.
+    Firefox and Safari are off that axis, so they fail independently."""
+    families = {"".join(c for c in name if not c.isdigit()) for name in SUGGESTED_FALLBACK_IMPERSONATE}
+
+    assert len(families) > 1, f"all suggestions share one family: {SUGGESTED_FALLBACK_IMPERSONATE}"
+
+
+def test_one_rescue_serves_the_page_without_promoting():
+    """A single 404 on the primary can be a transient hiccup. Adopting another
+    fingerprint for the client's whole life on that one observation is too big
+    a step to take from one data point."""
+    FakeSession.responses = {
+        "chrome": [FakeResponse(404)],
+        "firefox144": [FakeResponse(200, "the real page")],
+    }
+    client = make_client(fallback_impersonate=("firefox144",))
+
+    assert client.get("https://x.bandcamp.com/album/a") == "the real page"
+    assert client.impersonate == "chrome"
+
+
+def test_a_second_rescue_by_the_same_fingerprint_promotes_it():
+    FakeSession.responses = {
+        "chrome": [FakeResponse(404), FakeResponse(404)],
+        "firefox144": [FakeResponse(200, "first"), FakeResponse(200, "second"), FakeResponse(200, "third")],
+    }
+    client = make_client(fallback_impersonate=("firefox144",))
+
+    client.get("https://x.bandcamp.com/album/a")
+    client.get("https://x.bandcamp.com/album/b")
+
+    assert client.impersonate == "firefox144"
+    assert client.get("https://x.bandcamp.com/album/c") == "third"
 
 
 def test_a_404_confirmed_by_a_fallback_says_which_one():
@@ -230,7 +273,7 @@ def test_a_404_confirmed_by_a_fallback_says_which_one():
         "firefox144": [FakeResponse(404)],
         "safari184": [FakeResponse(404)],
     }
-    client = make_client()
+    client = make_client(fallback_impersonate=("chrome131", "firefox144", "safari184"))
 
     with pytest.raises(NotFoundError) as excinfo:
         client.get("https://x.bandcamp.com/album/gone")
@@ -248,7 +291,7 @@ def test_an_unverifiable_404_names_no_confirming_fingerprint():
         "firefox144": [FakeResponse(200, CHALLENGE_BODY)],
         "safari184": [FakeResponse(200, CHALLENGE_BODY)],
     }
-    client = make_client()
+    client = make_client(fallback_impersonate=("chrome131", "firefox144", "safari184"))
 
     with pytest.raises(NotFoundError) as excinfo:
         client.get("https://x.bandcamp.com/album/gone")

@@ -181,59 +181,28 @@ except ChallengeError:
 
 ### TLS fingerprints
 
-Bandcamp soft-blocks some TLS fingerprints by answering **HTTP 404** to pages a
-different fingerprint fetches fine, so a bare 404 is not proof of deletion. The
-client re-checks every 404 against a short list of known-good fingerprints
-before raising `NotFoundError`. If one of them serves the page, that fingerprint
-takes over the session for the rest of the client's life, so the extra request
-is paid once rather than on every later 404.
+`impersonate` picks the curl_cffi fingerprint the session uses, defaulting to
+the floating `"chrome"` alias. Worth changing if Bandcamp starts refusing the
+default one.
 
 ```python
-# Pick the fingerprint yourself (default: curl_cffi's floating "chrome" alias).
-client = BandcampClient(impersonate="chrome124")
-
-# Change or disable the re-check ladder.
-client = BandcampClient(fallback_impersonate=("chrome131", "chrome124"))
-client = BandcampClient(fallback_impersonate=())  # every 404 raises at once
-
-client.impersonate  # the fingerprint currently in use, after any promotion
+client = BandcampClient(impersonate="firefox144")
 ```
 
-Names come from curl_cffi's impersonate targets; entries the installed version
-does not know are skipped rather than raising. Which fingerprints are blocked
-varies by vantage point: two hosts can see the same cutoff between builds with
-the sides swapped, one serving the recent ones and challenging the old, the
-other the reverse. Measure from the machine that will run the fetches with
-`python scripts/probe_fingerprints.py`, which reads response bodies rather than
-status codes because a blocked fingerprint answers HTTP 200 with the
+Bandcamp can also serve one fingerprint a 404 on a page another one fetches
+fine. `fallback_impersonate` re-checks a 404 on other fingerprints before
+raising, and names the ones that agreed in `NotFoundError.confirmed_by`. It is
+off by default, since it costs an extra request per fallback on every genuine
+404. `scripts/probe_fingerprints.py` measures which fingerprints work from the
+machine that will run the fetches, reading response bodies rather than status
+codes because a blocked fingerprint can answer HTTP 200 with a bot-defence
 interstitial.
 
-The ladder only ever refuses to believe a 404, it never invents one. A fallback
-that errors, is challenged, or is unknown proves nothing, so it is skipped and
-the original 404 stands. A challenged *fallback* never arms the client's
-challenge backoff either: that session is a throwaway and says nothing about
-the primary.
-
-`NotFoundError.confirmed_by` names the fallback fingerprints that independently
-saw the same 404. It is empty when nobody could check, which is much weaker
-evidence than a 404 two working fingerprints agreed on. Callers that flag rows
-deleted should require it:
-
 ```python
-try:
-    album = AlbumAPI(client).get(url)
-except NotFoundError as e:
-    if e.confirmed_by:
-        mark_deleted(url)  # two independent fingerprints agree it is gone
-    else:
-        ...  # nothing could corroborate it; leave the row alone and retry
-```
+from bandcamp_explorer.core import SUGGESTED_FALLBACK_IMPERSONATE
 
-The default ladder deliberately spans browser families. Two Chrome builds share
-a failure axis: Bandcamp splits Chrome between 131 and 133a, and which side is
-served depends on where you fetch from, so a pair of Chrome fallbacks can land
-on the blocked side together and rescue nothing. Firefox and Safari are off that
-axis.
+client = BandcampClient(fallback_impersonate=SUGGESTED_FALLBACK_IMPERSONATE)
+```
 
 > Bandcamp removed the `dig_deeper` hub endpoint, so `DiscoverAPI` was dropped
 > in 0.6.0; use `DiscoverWebAPI`. `resolve_location` went with it: it resolved

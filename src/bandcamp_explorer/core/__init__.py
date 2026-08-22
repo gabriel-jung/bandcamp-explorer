@@ -8,7 +8,12 @@ returns None writes a fake "known zero" into a database).
 """
 
 from .api import AlbumAPI, ArtistAPI, DiscoverWebAPI, SearchAPI
-from .client import BandcampClient, ChallengeError, NotFoundError
+from .client import (
+    SUGGESTED_FALLBACK_IMPERSONATE,
+    BandcampClient,
+    ChallengeError,
+    NotFoundError,
+)
 from .countries import resolve_geoname
 from .utils import format_track_time, track_time_to_seconds
 
@@ -19,6 +24,7 @@ __all__ = [
     "ChallengeError",
     "NotFoundError",
     "DiscoverWebAPI",
+    "SUGGESTED_FALLBACK_IMPERSONATE",
     "SearchAPI",
     "format_track_time",
     "resolve_geoname",

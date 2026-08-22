@@ -19,19 +19,22 @@ _CHALLENGE_SCAN_BYTES = 8192
 
 CHALLENGE_BACKOFF_SECONDS = 120.0
 
-# curl_cffi's "chrome" alias floats to the newest build it ships. Bandcamp has
-# been soft-blocking the recent ones since 2026-08-12: they answer HTTP 404 to
-# album pages that older fingerprints fetch fine. Upgrading curl_cffi only moves
-# the alias further into the blocked range, so a 404 has to be re-checked on a
-# known-good fingerprint before it can be believed.
+# curl_cffi's "chrome" alias floats to the newest build it ships.
 DEFAULT_IMPERSONATE = "chrome"
 
-# Deliberately not two Chrome builds: they share a failure axis. Measured from
-# two vantage points, Bandcamp splits Chrome at the same place (131 and older
-# on one side, 133a and newer on the other) but serves opposite sides, so a
-# pair of Chrome fallbacks can land on the blocked side together and rescue
-# nothing. Firefox and Safari are off that axis entirely.
-FALLBACK_IMPERSONATE = ("chrome131", "firefox144", "safari184")
+# Opt-in: Bandcamp can serve one TLS fingerprint a 404 on a page another one
+# fetches fine, and the ladder re-checks a 404 before believing it. Off by
+# default because it costs an extra request per fallback on every genuine 404.
+FALLBACK_IMPERSONATE: tuple[str, ...] = ()
+
+# A starting point, not a claim that any of these is blocked. Several builds of
+# one browser share a failure axis, so a block on a build range can catch them
+# all at once; different engines fail independently and come first.
+SUGGESTED_FALLBACK_IMPERSONATE = ("firefox144", "safari184", "chrome131")
+
+# One 404 on the primary can be transient, which is too little to hand the
+# session to another fingerprint for the rest of its life.
+PROMOTE_AFTER_RESCUES = 2
 
 
 def _known_impersonate_targets() -> frozenset[str]:
@@ -60,15 +63,18 @@ class NotFoundError(Exception):
     The request helpers below catch that base class and return ``None``, so
     inheriting from it makes this exception swallow itself three lines after it
     is raised. Callers need a 404 to escape in order to tell a deleted entry
-    from a failed fetch: the scraping pipeline flags the former as deleted and
-    retries the latter, and collapsing the two means dead pages are re-fetched
-    forever. Keep this outside the request-exception hierarchy.
+    from a failed fetch: a crawler flags the former and retries the latter, and
+    collapsing the two means dead pages are re-fetched forever. Keep this
+    outside the request-exception hierarchy.
 
     ``confirmed_by`` names the fallback fingerprints that independently saw the
-    same 404. Empty means nobody could check (every fallback was challenged or
-    errored, or the ladder is disabled), which is weaker evidence than a 404 two
-    working fingerprints agreed on. Callers that flag deleted rows should
-    require a non-empty ``confirmed_by`` and retry the rest later.
+    same 404. It means "extra corroboration was obtained", never "this page is
+    really gone" nor its negation. It is empty whenever no fallback answered,
+    which with the re-check ladder off is always, so gating deletion on a
+    non-empty value would stop every deletion from ever being recorded. Only
+    callers who enabled the ladder can read anything into it: for them an empty
+    tuple means the re-check could not be carried out, which is a reason to
+    retry rather than to flag the row.
     """
 
     def __init__(self, url: str, confirmed_by: tuple[str, ...] = ()):
@@ -125,6 +131,7 @@ class BandcampClient:
         self._challenge_until = 0.0
         self.impersonate = impersonate
         self._fallback_impersonate = self._usable_fallbacks(impersonate, fallback_impersonate)
+        self._rescues: dict[str, int] = {}
         self._session = curl_requests.Session(impersonate=impersonate)
         logger.debug(f"HTTP client initialized on {impersonate}.")
 
@@ -211,9 +218,8 @@ class BandcampClient:
     def download_image(self, url: str, output_dir: str = "./images/") -> str | None:
         """Download an image to a local file, return saved path or None.
 
-        Used by the sibling ``bandcamp-explorer-data`` project for bulk
-        image harvesting. The filename comes from a remote URL, so the
-        resolved destination is checked to be inside ``output_dir``.
+        The filename comes from a remote URL, so the resolved destination is
+        checked to be inside ``output_dir``.
         """
         if not url:
             return None
@@ -283,6 +289,13 @@ class BandcampClient:
                 if _is_challenge(text):
                     logger.warning(f"Fallback {name} was challenged for {url}; trying the next one.")
                     continue
+                self._rescues[name] = self._rescues.get(name, 0) + 1
+                if self._rescues[name] < PROMOTE_AFTER_RESCUES:
+                    logger.warning(
+                        f"Fallback {name} served {url} where {self.impersonate} returned 404. "
+                        f"Not switching yet: one 404 can be transient, waiting for a second."
+                    )
+                    return text, ()
                 self._promote(name, session, url)
                 promoted = True
                 return text, ()
@@ -301,14 +314,16 @@ class BandcampClient:
     def _promote(self, name: str, session, url: str) -> None:
         """Adopt a fallback fingerprint for the rest of this client's life.
 
-        A 404 on the primary that another fingerprint serves is proof the
-        primary is soft-blocked. Keeping the working one means the extra
-        request is paid once instead of on every later 404, and ``post_json``
-        (search, discover) rides the unblocked session too.
+        Called once a fingerprint has rescued ``PROMOTE_AFTER_RESCUES`` separate
+        pages, which is what separates a soft-blocked primary from a one-off
+        404. Keeping the working one means the extra requests are paid once
+        instead of on every later 404, and ``post_json`` (search, discover)
+        rides the unblocked session too.
         """
         logger.warning(
-            f"Fingerprint {self.impersonate} looks soft-blocked: 404 on {url}, "
-            f"which {name} serves. Switching this client to {name}."
+            f"Fingerprint {self.impersonate} looks soft-blocked: {name} has now served "
+            f"{PROMOTE_AFTER_RESCUES} pages it 404'd, most recently {url}. "
+            f"Switching this client to {name}."
         )
         self._session.close()
         self._session = session

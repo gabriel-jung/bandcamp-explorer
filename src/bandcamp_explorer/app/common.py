@@ -16,10 +16,10 @@ class AlbumFetcher:
     image URL directly). ``lyrics_as_text=True`` selects the joined-string
     lyrics representation for Discord; the CLI uses the list-of-tracks form.
 
-    ``NotFoundError`` is absorbed here: the API layer lets a 404 escape so
-    the scraping pipeline can tell a deleted album from a failed fetch, but
-    the interactive frontends have no use for that distinction and want a
-    plain "nothing to show".
+    ``NotFoundError`` is absorbed here: the API layer lets a 404 escape so a
+    crawler can tell a deleted album from a failed fetch, but the interactive
+    frontends have no use for that distinction and want a plain "nothing to
+    show".
     """
 
     def __init__(
