@@ -4,8 +4,8 @@ and the dead-host confirmation on ``/music``.
 Two separate traps live here. Bandcamp can answer one TLS fingerprint a 404 on
 a page another fetches fine, so a bare 404 is not proof of deletion; and the
 root of a host that no longer exists never answers 404 at all, so a bare 200 is
-not proof of life either. The tests pin both directions: live pages must not be
-flagged deleted, and dead hosts must not stay undetectable.
+not proof of life either. The tests pin both directions: a live page must never
+raise ``NotFoundError``, and a host that is gone must not read as alive.
 """
 
 import pytest
@@ -230,8 +230,8 @@ def test_a_404_confirmed_by_a_fallback_says_which_one():
 
 def test_an_unverifiable_404_names_no_confirming_fingerprint():
     """Every fallback challenged means nobody could check, which is not the
-    same as a 404 two working fingerprints agreed on. Downstream needs the
-    difference to decide between marking a row deleted and retrying later."""
+    same as a 404 two working fingerprints agreed on. A caller needs the
+    difference to tell "gone" from "could not tell"."""
     FakeSession.responses = {
         "chrome": [FakeResponse(404)],
         "chrome131": [FakeResponse(200, CHALLENGE_BODY)],

@@ -19,6 +19,7 @@ from bandcamp_explorer.core.client import NotFoundError
 from bandcamp_explorer.core.parsers import ArtistPageParser
 
 from .conftest import FakeResponse, FakeSession, make_client
+from .test_artist_parser import INDEX_BODY, INDEX_RELEASE_URLS, INDEX_URL
 from .test_client import CHALLENGE_BODY
 
 ROOT = "https://gone.bandcamp.com"
@@ -146,3 +147,17 @@ def test_a_root_that_never_arrived_costs_no_confirmation_request():
 
     assert artist_api().get(LIVE, fetch_art=False) is None
     assert FakeSession.calls == [("chrome", LIVE)]
+
+
+def test_an_index_page_artist_is_not_a_deleted_host():
+    """The custom index-page theme has neither of the standard layout's
+    markers, so before it was parsed its root yielded no id and no name: the
+    signature this module reads as gone, from a live artist with releases."""
+    FakeSession.by_url = {INDEX_URL: FakeResponse(200, INDEX_BODY)}
+
+    artist = artist_api().get(INDEX_URL, fetch_art=False)
+
+    assert artist is not None
+    assert artist["name"] == "wizard ashdod"
+    assert [item["url"] for item in artist["discography"]] == INDEX_RELEASE_URLS
+    assert FakeSession.calls == [("chrome", INDEX_URL)]

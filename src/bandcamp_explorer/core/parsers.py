@@ -7,7 +7,7 @@ uses the site's JSON search endpoint instead.
 
 import json
 from abc import ABC, abstractmethod
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 from loguru import logger
@@ -216,6 +216,20 @@ class AlbumPageParser(BasePageParser):
         }
 
 
+def _release_type(url: str | None) -> str | None:
+    """``"album"`` / ``"track"`` for a release URL, else ``None``.
+
+    For markup that carries no ``data-item-id`` to read the type from.
+    """
+    if not url:
+        return None
+    path = urlsplit(url).path
+    for kind in ("album", "track"):
+        if path.startswith(f"/{kind}/"):
+            return kind
+    return None
+
+
 class ArtistPageParser(BasePageParser):
     """Parse a Bandcamp artist/label page.
 
@@ -223,11 +237,19 @@ class ArtistPageParser(BasePageParser):
     and the discography grid from the ``/music`` subpage. Set
     ``discography_only=True`` to skip profile extraction when the caller
     has already fetched it from the root page.
+
+    Two layouts are served. The standard one keeps the profile in
+    ``p#band-name-location`` and the releases in ``ol#music-grid``; the custom
+    "index page" theme has neither, naming the band only in the ``data-band``
+    JSON blob and listing releases as ``.ipCell`` anchors. Both are read, DOM
+    first.
     """
 
     def __init__(self, soup: BeautifulSoup, url: str, *, discography_only: bool = False):
         super().__init__(soup, url)
         self._discography_only = discography_only
+        self._band: dict | None = None
+        self._band_loaded = False
 
     def parse(self) -> dict | None:
         if self._discography_only:
@@ -251,6 +273,37 @@ class ArtistPageParser(BasePageParser):
             artist["discography"] = []
 
         return artist
+
+    def _band_data(self) -> dict:
+        """Identity from the ``data-band`` JSON blob, or ``{}``.
+
+        Both live layouts carry it. Only ``id`` and ``name`` are read from it;
+        it carries no location, bio or image, so those stay ``None`` where the
+        DOM has no header.
+
+        It is a fallback, not the primary source, and must stay one that a
+        defunct subdomain's root cannot satisfy: neither body such a root
+        serves (Bandcamp's signup page, the bot-defence interstitial) carries
+        a ``data-band``, which is what keeps a nameless root distinguishable
+        from a live artist. Re-check both before widening where a name may
+        come from. The attribute name is exact: ``data-for-band-id`` on the
+        signup page matches neither this nor ``[data-band-id]``.
+        """
+        if self._band_loaded:
+            return self._band or {}
+        self._band_loaded = True
+
+        el = self.soup.select_one("[data-band]")
+        raw = el.get("data-band") if el else None
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning(f"Failed to parse data-band on {self.url}: {e}")
+                parsed = None
+            if isinstance(parsed, dict):
+                self._band = parsed
+        return self._band or {}
 
     def _parse_profile(self) -> dict:
         """Extract artist profile from the page HTML (name, location, bio, image).
@@ -289,6 +342,13 @@ class ArtistPageParser(BasePageParser):
         band_el = self.soup.select_one("[data-band-id]")
         band_id = band_el.get("data-band-id") if band_el else None
 
+        # The index-page theme has neither marker. Filled per field rather than
+        # as a whole-profile branch, so a layout keeping one still parses.
+        if not band_id:
+            band_id = self._band_data().get("id")
+        if not name:
+            name = clean_text(str(self._band_data().get("name") or ""))
+
         # Label link ("more from Napalm Records" -> label page)
         label_name = None
         label_url = None
@@ -317,15 +377,17 @@ class ArtistPageParser(BasePageParser):
         }
 
     def _parse_discography(self) -> list[dict]:
-        """Extract release items from the music grid.
+        """Extract release items from whichever layout the page uses.
 
-        Combines items visible in the HTML grid (``ol#music-grid > li``)
-        with overflow items stored in the ``data-client-items`` JSON
-        attribute (loaded by JavaScript in the browser).
+        The standard music grid combines items visible in the HTML
+        (``ol#music-grid > li``) with overflow items stored in the
+        ``data-client-items`` JSON attribute (loaded by JavaScript in the
+        browser). Its absence is not an empty discography: the index-page
+        theme lists releases elsewhere.
         """
         music_grid = self.soup.find("ol", id="music-grid")
         if not music_grid:
-            return []
+            return self._parse_index_page_discography()
 
         items = []
 
@@ -379,5 +441,61 @@ class ArtistPageParser(BasePageParser):
                         "art_url": None,
                     }
                 )
+
+        return items
+
+    def _parse_index_page_discography(self) -> list[dict]:
+        """Extract release items from the custom "index page" theme.
+
+        Each release is a ``.ipCell`` inside ``span.indexpage_list``, title in
+        ``.ipCellLabel1`` and the release's own artist in ``.ipCellLabel2``.
+        No ``data-client-items`` overflow payload here, so the HTML holds the
+        whole list. Links to other subdomains are common and stay absolute,
+        exactly as ``music-grid`` items do.
+
+        Two traps: trailing cells are empty padding that squares off a row and
+        carry no anchor, and anchors also point at other bands' ``/releases``
+        hubs, which are discography pages rather than releases. Typing from
+        the URL drops both, so callers keep getting release URLs only.
+        """
+        cells = self.soup.select("span.indexpage_list .ipCell")
+        if not cells:
+            return []
+
+        band_name = clean_text(str(self._band_data().get("name") or ""))
+        items = []
+
+        for cell in cells:
+            link = cell.select_one("a[href]")
+            if not link:
+                continue
+
+            url = strip_tracker(urljoin(self.url, link.get("href", "")))
+            item_type = _release_type(url)
+            if not item_type:
+                continue
+
+            title_el = cell.select_one(".ipCellLabel1")
+            title = clean_text(title_el.get_text()) if title_el else ""
+
+            # Label2 names the artist on every cell, the page's own included.
+            # Reported only when it differs, to match the grid, where
+            # artist_name is None unless an .artist-override says so.
+            artist_el = cell.select_one(".ipCellLabel2")
+            artist_name = clean_text(artist_el.get_text()) if artist_el else None
+            if artist_name and band_name and artist_name.casefold() == band_name.casefold():
+                artist_name = None
+
+            art_el = cell.select_one("img")
+            items.append(
+                {
+                    "_type": "album",
+                    "title": title,
+                    "artist_name": artist_name or None,
+                    "item_type": item_type,
+                    "url": url,
+                    "art_url": art_el.get("src") if art_el else None,
+                }
+            )
 
         return items

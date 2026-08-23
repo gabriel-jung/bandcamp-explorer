@@ -314,7 +314,7 @@ class SearchAPI(BaseAPI):
     """Search Bandcamp via the site's own search JSON endpoint.
 
     The HTML search page at ``/search`` is fronted by a bot-defence
-    interstitial that answers HTTP 200 with no results in it, so scraping it
+    interstitial that answers HTTP 200 with no results in it, so parsing it
     silently returns nothing. This endpoint is what the site's own search box
     calls, and it is not gated.
 

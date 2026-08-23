@@ -123,7 +123,7 @@ iTerm2 or Kitty image protocol (iTerm2, Kitty, WezTerm, Mintty).
 ## Library
 
 The `core` module has no terminal dependencies; use it in scripts,
-pipelines, or other tools. All data is returned as plain dicts with a
+bots, or other tools. All data is returned as plain dicts with a
 `_type` discriminator key.
 
 ```python

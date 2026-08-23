@@ -27,7 +27,7 @@ DEFAULT_IMPERSONATE = "chrome"
 # another served the page. That has not been reproduced here, and a probe that
 # counts HTTP 200 as "served" will report it wrongly, since the bot-defence
 # interstitial is itself a 200. Off by default: it costs an extra request per
-# fallback on every genuine 404, which a bulk crawler pays thousands of times.
+# fallback on every genuine 404, and every 404 is genuine until shown otherwise.
 FALLBACK_IMPERSONATE: tuple[str, ...] = ()
 
 # A starting point, not a claim that any of these is blocked. Several builds of
@@ -68,10 +68,9 @@ class NotFoundError(Exception):
     Deliberately *not* a subclass of ``curl_requests.exceptions.RequestException``.
     The request helpers below catch that base class and return ``None``, so
     inheriting from it makes this exception swallow itself three lines after it
-    is raised. Callers need a 404 to escape in order to tell a deleted entry
-    from a failed fetch: a crawler flags the former and retries the latter, and
-    collapsing the two means dead pages are re-fetched forever. Keep this
-    outside the request-exception hierarchy.
+    is raised. A 404 has to escape so callers can tell a deleted entry from a
+    failed fetch, which are worth acting on differently. Keep this outside the
+    request-exception hierarchy.
 
     Since 0.8.0 this can also escape :meth:`BandcampClient.get` where a
     ``ChallengeError`` used to: the root page of a host that no longer exists
@@ -86,7 +85,7 @@ class NotFoundError(Exception):
     non-empty value would stop every deletion from ever being recorded. Only
     callers who enabled the ladder can read anything into it: for them an empty
     tuple means the re-check could not be carried out, which is a reason to
-    retry rather than to flag the row.
+    retry rather than to conclude anything.
     """
 
     def __init__(self, url: str, confirmed_by: tuple[str, ...] = ()):
@@ -133,7 +132,7 @@ class BandcampClient:
 
     Rate limits:
         - Normal requests: 1.0s between calls (interactive use).
-        - Crawl requests: 5.0s between calls (bulk discovery/scraping).
+        - Crawl requests: 5.0s between calls (multi-page walks, image bytes).
 
     Once a bot-defence challenge is seen, further requests fail fast for
     ``CHALLENGE_BACKOFF_SECONDS`` rather than hammering a blocked endpoint.
