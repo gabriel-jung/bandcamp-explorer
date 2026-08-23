@@ -179,6 +179,16 @@ except ChallengeError:
     ...  # blocked for now, retry later
 ```
 
+One case does not follow that split. The root page of an artist subdomain that
+no longer exists never answers 404: it answers HTTP 200 with either the
+bot-defence interstitial or Bandcamp's signup page, so nothing read off the
+root tells a deleted host from a live one. Since 0.8.0, when a host root
+produces no artist, `/music` on the same host is asked before any conclusion is
+drawn, and a 404 there raises `NotFoundError` where earlier versions raised
+`ChallengeError` or returned an artist with no name. Any other answer keeps the
+old behaviour: only a real 404 is read as gone. It costs one extra request per
+dead host, once.
+
 ### TLS fingerprints
 
 `impersonate` picks the curl_cffi fingerprint the session uses, defaulting to
@@ -189,14 +199,15 @@ default one.
 client = BandcampClient(impersonate="firefox144")
 ```
 
-Bandcamp can also serve one fingerprint a 404 on a page another one fetches
-fine. `fallback_impersonate` re-checks a 404 on other fingerprints before
-raising, and names the ones that agreed in `NotFoundError.confirmed_by`. It is
-off by default, since it costs an extra request per fallback on every genuine
-404. `scripts/probe_fingerprints.py` measures which fingerprints work from the
-machine that will run the fetches, reading response bodies rather than status
-codes because a blocked fingerprint can answer HTTP 200 with a bot-defence
-interstitial.
+`fallback_impersonate` is an escape hatch for a host that finds one
+fingerprint answered a 404 where another served the page: it re-checks a 404 on
+other fingerprints before raising, and names the ones that agreed in
+`NotFoundError.confirmed_by`. That situation has not been reproduced here, and
+the ladder is off by default since it costs an extra request per fallback on
+every genuine 404. `scripts/probe_fingerprints.py` measures which fingerprints
+work from the machine that will run the fetches, reading response bodies rather
+than status codes because a blocked fingerprint answers HTTP 200 with a
+bot-defence interstitial, which a status-code-only probe scores as success.
 
 ```python
 from bandcamp_explorer.core import SUGGESTED_FALLBACK_IMPERSONATE

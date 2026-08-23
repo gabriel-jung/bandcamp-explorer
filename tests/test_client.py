@@ -1,13 +1,12 @@
-"""Tests for the HTTP client's fingerprint selection and 404 fallback ladder.
+"""Tests for the HTTP client: fingerprint selection, the 404 fallback ladder,
+and the dead-host confirmation on ``/music``.
 
-Bandcamp soft-blocks some TLS fingerprints by answering HTTP 404 to pages a
-different fingerprint fetches fine, so a bare 404 is not proof of deletion.
-These tests pin the two behaviours that keep live pages from being flagged
-deleted: the caller can pick a fingerprint, and the client re-checks a 404
-against known-good fallbacks before letting ``NotFoundError`` escape.
+Two separate traps live here. Bandcamp can answer one TLS fingerprint a 404 on
+a page another fetches fine, so a bare 404 is not proof of deletion; and the
+root of a host that no longer exists never answers 404 at all, so a bare 200 is
+not proof of life either. The tests pin both directions: live pages must not be
+flagged deleted, and dead hosts must not stay undetectable.
 """
-
-from typing import ClassVar
 
 import pytest
 from curl_cffi import requests as curl_requests
@@ -15,65 +14,13 @@ from curl_cffi import requests as curl_requests
 from bandcamp_explorer.core.client import (
     FALLBACK_IMPERSONATE,
     SUGGESTED_FALLBACK_IMPERSONATE,
-    BandcampClient,
     ChallengeError,
     NotFoundError,
 )
 
+from .conftest import FakeResponse, FakeSession, make_client
+
 CHALLENGE_BODY = "<html><head><title>Client Challenge</title></head></html>"
-
-
-class FakeResponse:
-    def __init__(self, status_code: int, text: str = "ok"):
-        self.status_code = status_code
-        self.text = text
-        self.content = text.encode()
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise curl_requests.exceptions.HTTPError(f"status {self.status_code}")
-
-
-class FakeSession:
-    """Stands in for ``curl_cffi.requests.Session``, keyed by impersonate name."""
-
-    #: impersonate name -> list of responses to hand out, in order.
-    responses: ClassVar[dict[str, list[FakeResponse]]] = {}
-    #: every (impersonate, url) pair requested, across all sessions.
-    calls: ClassVar[list[tuple[str, str]]] = []
-
-    def __init__(self, impersonate: str):
-        self.impersonate = impersonate
-        self.closed = False
-
-    def get(self, url, params=None, timeout=None):
-        FakeSession.calls.append((self.impersonate, url))
-        queue = FakeSession.responses.get(self.impersonate)
-        if not queue:
-            raise AssertionError(f"unexpected GET on {self.impersonate}: {url}")
-        return queue.pop(0)
-
-    def post(self, url, json=None, timeout=None):
-        FakeSession.calls.append((self.impersonate, url))
-        return FakeSession.responses[self.impersonate].pop(0)
-
-    def close(self):
-        self.closed = True
-
-
-@pytest.fixture(autouse=True)
-def fake_session(monkeypatch):
-    FakeSession.responses = {}
-    FakeSession.calls = []
-    monkeypatch.setattr(curl_requests, "Session", lambda impersonate=None, **kw: FakeSession(impersonate))
-    return FakeSession
-
-
-def make_client(**kwargs) -> BandcampClient:
-    client = BandcampClient(**kwargs)
-    client.rate_limit_seconds = 0.0
-    client.crawl_delay = 0.0
-    return client
 
 
 def test_default_impersonate_is_the_floating_chrome_alias():
@@ -307,3 +254,176 @@ def test_a_404_with_the_ladder_disabled_confirms_nothing():
         client.get("https://x.bandcamp.com/album/gone")
 
     assert excinfo.value.confirmed_by == ()
+
+
+# --- dead-host confirmation on /music -------------------------------------
+#
+# A subdomain that no longer exists does not 404 on its root. It answers 200
+# with either the bot-defence interstitial or Bandcamp's signup page, depending
+# on the address and session doing the asking. Only ``/music`` on that same
+# host answers a plain 404, so that is what "gone" has to be read from.
+
+ROOT = "https://gone.bandcamp.com"
+ROOT_MUSIC = "https://gone.bandcamp.com/music"
+
+
+def test_a_challenged_host_root_whose_music_404s_raises_not_found():
+    """The reason this cannot live in a caller: ``_check_challenge`` arms the
+    backoff the instant it sees the interstitial, and every later URL is then
+    refused locally without touching the network. Confirming has to happen
+    before that, which only the client can do."""
+    FakeSession.by_url = {
+        ROOT: FakeResponse(200, CHALLENGE_BODY),
+        ROOT_MUSIC: FakeResponse(404),
+    }
+    client = make_client()
+
+    with pytest.raises(NotFoundError):
+        client.get(ROOT)
+
+    assert FakeSession.calls == [("chrome", ROOT), ("chrome", ROOT_MUSIC)]
+
+
+def test_confirming_a_dead_host_does_not_arm_the_challenge_backoff():
+    """A dead host is not an upstream block. Stalling the whole client for two
+    minutes on every one of them is what froze the crawl in the first place."""
+    FakeSession.by_url = {
+        ROOT: FakeResponse(200, CHALLENGE_BODY),
+        ROOT_MUSIC: FakeResponse(404),
+        "https://live.bandcamp.com": FakeResponse(200, "a live page"),
+    }
+    client = make_client()
+
+    with pytest.raises(NotFoundError):
+        client.get(ROOT)
+
+    assert client.get("https://live.bandcamp.com") == "a live page"
+
+
+def test_a_challenged_host_root_whose_music_answers_200_still_challenges():
+    """A live host being challenged is the case the backoff exists for, and it
+    has to keep working. Only a real 404 means gone."""
+    FakeSession.by_url = {
+        ROOT: FakeResponse(200, CHALLENGE_BODY),
+        ROOT_MUSIC: FakeResponse(200, "the music page"),
+    }
+    client = make_client()
+
+    with pytest.raises(ChallengeError):
+        client.get(ROOT)
+
+
+def test_a_challenged_host_root_whose_music_is_also_challenged_still_challenges():
+    FakeSession.by_url = {
+        ROOT: FakeResponse(200, CHALLENGE_BODY),
+        ROOT_MUSIC: FakeResponse(200, CHALLENGE_BODY),
+    }
+    client = make_client()
+
+    with pytest.raises(ChallengeError):
+        client.get(ROOT)
+
+
+def test_a_challenge_on_a_url_with_a_path_is_not_confirmed():
+    """Appending ``/music`` to a path invents a page nobody asked for, and the
+    404 it would return says nothing about the host."""
+    FakeSession.by_url = {"https://x.bandcamp.com/album/a": FakeResponse(200, CHALLENGE_BODY)}
+    client = make_client()
+
+    with pytest.raises(ChallengeError):
+        client.get("https://x.bandcamp.com/album/a")
+
+    assert FakeSession.calls == [("chrome", "https://x.bandcamp.com/album/a")]
+
+
+def test_a_challenge_on_a_music_url_is_not_confirmed():
+    """``/music/music`` is a genuine 404 on a perfectly live host, so probing it
+    would report every challenged ``/music`` page as a deleted host."""
+    FakeSession.by_url = {ROOT_MUSIC: FakeResponse(200, CHALLENGE_BODY)}
+    client = make_client()
+
+    with pytest.raises(ChallengeError):
+        client.get(ROOT_MUSIC)
+
+    assert FakeSession.calls == [("chrome", ROOT_MUSIC)]
+
+
+def test_an_unchallenged_page_costs_no_confirmation_request():
+    FakeSession.by_url = {ROOT: FakeResponse(200, "a live page")}
+    client = make_client()
+
+    assert client.get(ROOT) == "a live page"
+    assert FakeSession.calls == [("chrome", ROOT)]
+
+
+def test_host_root_is_gone_refuses_anything_that_is_not_a_bare_root():
+    client = make_client()
+
+    assert not client.host_root_is_gone("https://x.bandcamp.com/album/a")
+    assert not client.host_root_is_gone("https://x.bandcamp.com/music")
+    assert not client.host_root_is_gone("https://x.bandcamp.com/?x=1")
+    assert FakeSession.calls == []
+
+
+def test_host_root_is_gone_accepts_a_trailing_slash_without_doubling_it():
+    FakeSession.by_url = {ROOT_MUSIC: FakeResponse(404)}
+    client = make_client()
+
+    assert client.host_root_is_gone(ROOT + "/")
+    assert FakeSession.calls == [("chrome", ROOT_MUSIC)]
+
+
+def test_a_transport_failure_on_the_confirmation_is_not_a_deletion():
+    FakeSession.by_url = {ROOT: FakeResponse(200, CHALLENGE_BODY)}
+    client = make_client()
+
+    def explode(url, params=None, timeout=None):
+        raise curl_requests.exceptions.ConnectionError("boom")
+
+    original = client._session.get
+
+    def routed(url, params=None, timeout=None):
+        return explode(url) if url == ROOT_MUSIC else original(url, params, timeout)
+
+    client._session.get = routed
+
+    with pytest.raises(ChallengeError):
+        client.get(ROOT)
+
+
+def test_a_promoted_fingerprint_leaves_its_own_fallback_list():
+    """Otherwise the new primary re-checks its own 404s: one wasted request on
+    every genuine 404 forever, and ``confirmed_by`` naming the primary as if a
+    second fingerprint had independently agreed."""
+    FakeSession.responses = {
+        "chrome": [FakeResponse(404), FakeResponse(404)],
+        "firefox144": [
+            FakeResponse(200, "first"),
+            FakeResponse(200, "second"),
+            FakeResponse(404),
+        ],
+    }
+    client = make_client(fallback_impersonate=("firefox144",))
+
+    client.get("https://x.bandcamp.com/album/a")
+    client.get("https://x.bandcamp.com/album/b")
+    assert client.impersonate == "firefox144"
+
+    with pytest.raises(NotFoundError) as excinfo:
+        client.get("https://x.bandcamp.com/album/gone")
+
+    assert client._fallback_impersonate == ()
+    assert excinfo.value.confirmed_by == ()
+    assert FakeSession.calls[-1] == ("firefox144", "https://x.bandcamp.com/album/gone")
+
+
+def test_a_parameterised_request_is_not_confirmed_as_a_host_root():
+    """The URL is a bare root but the request is not: the confirmation would
+    fetch /music without the params and answer a question nobody asked."""
+    FakeSession.by_url = {ROOT: FakeResponse(200, CHALLENGE_BODY), ROOT_MUSIC: FakeResponse(404)}
+    client = make_client()
+
+    with pytest.raises(ChallengeError):
+        client.get(ROOT, params={"page": 2})
+
+    assert FakeSession.calls == [("chrome", ROOT)]

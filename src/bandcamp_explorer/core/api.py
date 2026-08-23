@@ -37,6 +37,20 @@ class BaseAPI:
     def __init__(self, client: BandcampClient):
         self._client = client
 
+    def _fetch_page(
+        self, url: str, parser_class, params: dict | None = None, **kwargs
+    ) -> tuple[str | None, dict | None]:
+        """Fetch a page and parse it, returning ``(html, parsed)``.
+
+        Both halves, because ``parsed is None`` alone conflates a page that
+        never arrived with one that arrived and made no sense.
+        """
+        html = self._client.get(url, params=params)
+        if not html:
+            return None, None
+        parser = parser_class(BeautifulSoup(html, "html.parser"), url, **kwargs)
+        return html, parser.parse()
+
     def _get_page(self, url: str, parser_class, params: dict | None = None, **kwargs) -> dict | None:
         """Fetch a page and parse it into a structured dict.
 
@@ -44,11 +58,7 @@ class BaseAPI:
         to the given parser class. Extra kwargs are forwarded to the
         parser constructor.
         """
-        html = self._client.get(url, params=params)
-        if not html:
-            return None
-        parser = parser_class(BeautifulSoup(html, "html.parser"), url, **kwargs)
-        return parser.parse()
+        return self._fetch_page(url, parser_class, params, **kwargs)[1]
 
     def _attach_image(self, entity: dict) -> None:
         """Fetch cover art / photo bytes and attach as ``_art_data``."""
@@ -339,6 +349,23 @@ class SearchAPI(BaseAPI):
         return results
 
 
+def _looks_like_a_dead_host_root(artist: dict | None) -> bool:
+    """True for a root page that parsed cleanly and named no artist.
+
+    The signup page a dead host serves parses without error into a dict whose
+    ``artist_id`` and ``name`` are both empty; every live page measured carries
+    at least one. Either alone counts as alive, so losing one field is never
+    read as death.
+
+    ``artist is None`` is deliberately not this case: the parser returns None
+    when profile extraction raised, which is markup that moved or a truncated
+    body. Unknown, worth retrying, not evidence.
+    """
+    if artist is None:
+        return False
+    return not (artist.get("artist_id") or artist.get("name"))
+
+
 class ArtistAPI(BaseAPI):
     """Fetch and parse Bandcamp artist/label pages."""
 
@@ -354,8 +381,27 @@ class ArtistAPI(BaseAPI):
 
         A 404 on the root page propagates as ``NotFoundError`` so callers can
         tell a deleted artist from a failed fetch.
+
+        Since 0.8.0 it also covers what a 404 cannot express: a dead host's root
+        answers 200 with Bandcamp's signup page, which parses into an artist
+        with no id and no name. When the root parses and names nobody,
+        ``/music`` is asked and a 404 there means the host is gone. Anything
+        else returns ``None``.
         """
-        artist = self._get_page(artist_url, ArtistPageParser)
+        html, artist = self._fetch_page(artist_url, ArtistPageParser)
+        if html is None:
+            return None
+
+        if _looks_like_a_dead_host_root(artist):
+            if self._client.host_root_is_gone(artist_url):
+                logger.info(f"Artist root {artist_url} names no artist and /music is 404: host is gone.")
+                raise NotFoundError(artist_url)
+            # Falling through would re-fetch the /music URL just probed, this
+            # time through client.get, where a challenge arms the backoff the
+            # confirmation exists to get ahead of.
+            logger.warning(f"Artist root {artist_url} names no artist, and /music did not 404.")
+            return None
+
         if not artist:
             return None
 
@@ -370,11 +416,11 @@ class ArtistAPI(BaseAPI):
     def _fetch_discography(self, artist_url: str) -> list[dict]:
         """Fetch the ``/music`` subpage discography, or [] if unavailable.
 
-        This page is supplementary: the root page already yielded the profile.
-        A 404 here (``/music/music`` when the caller passed a ``/music`` URL,
-        or an artist with no music page) must not fail the whole artist, and
-        above all must not surface as ``NotFoundError`` -- callers read that as
-        "this artist is deleted" and would flag a live one.
+        Supplementary: the root already yielded the profile, so the host is live
+        by construction and a 404 here must not surface as ``NotFoundError`` --
+        callers read that as deleted and would flag a live one. The 404 actually
+        observed is ``/music/music``, from a caller passing a URL already ending
+        in ``/music``; every live host measured serves ``/music`` with 200.
         """
         base = artist_url.rstrip("/")
         music_url = base if base.endswith("/music") else base + "/music"

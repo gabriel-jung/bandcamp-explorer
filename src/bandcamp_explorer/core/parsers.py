@@ -253,41 +253,49 @@ class ArtistPageParser(BasePageParser):
         return artist
 
     def _parse_profile(self) -> dict:
-        """Extract artist profile from the page HTML (name, location, bio, image)."""
+        """Extract artist profile from the page HTML (name, location, bio, image).
+
+        Selectors rather than ``find(..., class_=...)`` throughout: ``find`` can
+        hand back a ``NavigableString``, which is a ``str`` subclass whose own
+        ``find`` takes no keyword arguments, so a nested lookup on one raises
+        ``TypeError`` and loses the whole profile. ``select_one`` only ever
+        returns a tag or ``None``, which removes the failure mode instead of
+        catching it downstream.
+        """
         name = ""
         location = None
 
-        name_el = self.soup.find("p", id="band-name-location")
+        name_el = self.soup.select_one("p#band-name-location")
         if name_el:
-            name_span = name_el.find("span", class_="title")
+            name_span = name_el.select_one("span.title")
             name = name_span.get_text().strip() if name_span else ""
-            loc_span = name_el.find("span", class_="location")
+            loc_span = name_el.select_one("span.location")
             location = loc_span.get_text().strip() if loc_span else None
 
         # p#bio-text has the full bio (including hidden .peekaboo-text span),
         # but also a .peekaboo-link ("... more") that we strip out
-        bio_el = self.soup.find("p", id="bio-text")
+        bio_el = self.soup.select_one("p#bio-text")
         bio = None
         if bio_el:
-            link = bio_el.find("span", class_="peekaboo-link")
+            link = bio_el.select_one("span.peekaboo-link")
             if link:
                 link.decompose()
             bio = clean_text(bio_el.get_text())
 
-        img_el = self.soup.find("img", class_="band-photo")
+        img_el = self.soup.select_one("img.band-photo")
         image_url = img_el.get("src") if img_el else None
 
         # Extract artist_id from embedded page data
-        band_el = self.soup.find(attrs={"data-band-id": True})
+        band_el = self.soup.select_one("[data-band-id]")
         band_id = band_el.get("data-band-id") if band_el else None
 
-        # Label link ("more from Napalm Records" → label page)
+        # Label link ("more from Napalm Records" -> label page)
         label_name = None
         label_url = None
-        label_link = self.soup.find("a", class_="back-to-label-link")
+        label_link = self.soup.select_one("a.back-to-label-link")
         if label_link:
             label_url = label_link.get("href", "").split("?")[0]
-            label_span = label_link.find("span", class_="back-link-text")
+            label_span = label_link.select_one("span.back-link-text")
             if label_span:
                 label_text = clean_text(label_span.get_text())
                 # Strip "more from" prefix

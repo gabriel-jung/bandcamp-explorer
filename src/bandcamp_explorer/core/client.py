@@ -3,6 +3,7 @@
 import json
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from curl_cffi import requests as curl_requests
 from loguru import logger
@@ -22,15 +23,20 @@ CHALLENGE_BACKOFF_SECONDS = 120.0
 # curl_cffi's "chrome" alias floats to the newest build it ships.
 DEFAULT_IMPERSONATE = "chrome"
 
-# Opt-in: Bandcamp can serve one TLS fingerprint a 404 on a page another one
-# fetches fine, and the ladder re-checks a 404 before believing it. Off by
-# default because it costs an extra request per fallback on every genuine 404.
+# Opt-in escape hatch for a host that finds one fingerprint answered a 404 where
+# another served the page. That has not been reproduced here, and a probe that
+# counts HTTP 200 as "served" will report it wrongly, since the bot-defence
+# interstitial is itself a 200. Off by default: it costs an extra request per
+# fallback on every genuine 404, which a bulk crawler pays thousands of times.
 FALLBACK_IMPERSONATE: tuple[str, ...] = ()
 
 # A starting point, not a claim that any of these is blocked. Several builds of
 # one browser share a failure axis, so a block on a build range can catch them
-# all at once; different engines fail independently and come first.
-SUGGESTED_FALLBACK_IMPERSONATE = ("firefox144", "safari184", "chrome131")
+# all at once; different engines fail independently and come first. The Chrome
+# entry is a recent build on purpose: older ones have been measured challenged
+# on at least one host, and a challenged fallback corroborates nothing while
+# still costing a request. Measure with scripts/probe_fingerprints.py.
+SUGGESTED_FALLBACK_IMPERSONATE = ("firefox144", "safari184", "chrome136")
 
 # One 404 on the primary can be transient, which is too little to hand the
 # session to another fingerprint for the rest of its life.
@@ -67,6 +73,12 @@ class NotFoundError(Exception):
     collapsing the two means dead pages are re-fetched forever. Keep this
     outside the request-exception hierarchy.
 
+    Since 0.8.0 this can also escape :meth:`BandcampClient.get` where a
+    ``ChallengeError`` used to: the root page of a host that no longer exists
+    never answers 404, so a bare host root that is challenged is re-checked on
+    its ``/music`` subpage before the challenge is believed. See
+    :meth:`BandcampClient.host_root_is_gone`.
+
     ``confirmed_by`` names the fallback fingerprints that independently saw the
     same 404. It means "extra corroboration was obtained", never "this page is
     really gone" nor its negation. It is empty whenever no fallback answered,
@@ -96,6 +108,24 @@ def _is_challenge(text: str) -> bool:
     """Detect Bandcamp's bot-defence interstitial in a response body."""
     head = text[:_CHALLENGE_SCAN_BYTES]
     return any(marker in head for marker in _CHALLENGE_MARKERS)
+
+
+def _is_bare_host_root(url: str) -> bool:
+    """True for ``https://host/`` with nothing after it.
+
+    The ``/music`` re-check only means anything on a host root: appending it to
+    a URL that already carries a path invents a page nobody asked for, and
+    appending it to a ``/music`` URL yields ``/music/music``, a genuine 404 that
+    would then be read as a dead host.
+    """
+    parts = urlsplit(url)
+    return (
+        parts.scheme in ("http", "https")
+        and bool(parts.netloc)
+        and parts.path in ("", "/")
+        and not parts.query
+        and not parts.fragment
+    )
 
 
 class BandcampClient:
@@ -152,14 +182,20 @@ class BandcampClient:
     def get(self, url: str, params: dict | None = None, crawl: bool = False) -> str | None:
         """GET request, return response text or None on failure.
 
-        A 404 is re-checked against the fallback fingerprints before it is
-        believed, because Bandcamp soft-blocks some of them with a 404. If one
-        of them serves the page, that fingerprint takes over the session for
-        good and its body is returned.
+        When fallback fingerprints are configured, a 404 is re-checked against
+        them before it is believed. If one of them serves the page, that
+        fingerprint takes over the session for good and its body is returned.
+        The ladder is off unless a caller turns it on; see
+        ``FALLBACK_IMPERSONATE``.
 
         Raises ``NotFoundError`` on a 404 no fingerprint could contradict, and
         ``ChallengeError`` on a bot-defence response. Every other failure is
         logged and returns ``None``.
+
+        One challenge does not raise: a challenged *host root* is re-checked on
+        ``/music`` first, and a 404 there raises ``NotFoundError`` instead,
+        because a dead host's root cannot answer 404 itself. See
+        :meth:`host_root_is_gone`.
         """
         self._guard_challenge_backoff(url)
         self._wait_between_requests(crawl=crawl)
@@ -179,6 +215,13 @@ class BandcampClient:
             logger.error(f"GET failed for {url}: {e}")
             return None
         # Outside the except block: a challenge must not be downgraded to None.
+        # A parameterised request is not a bare host root even when its URL is:
+        # the confirmation would fetch /music without those params and answer a
+        # question nobody asked.
+        confirmable = not params
+        if confirmable and _is_challenge(text) and self.host_root_is_gone(url, crawl=crawl):
+            logger.warning(f"Challenged host root {url} is gone: /music answered 404.")
+            raise NotFoundError(url)
         self._check_challenge(text, url)
         return text
 
@@ -251,6 +294,42 @@ class BandcampClient:
         except OSError as e:
             logger.debug(f"Failed to save {url}: {e}")
             return None
+
+    def host_root_is_gone(self, url: str, crawl: bool = False) -> bool:
+        """Ask ``url + "/music"`` whether a host root belongs to a dead host.
+
+        The root of a subdomain that no longer exists never answers 404: it
+        answers 200 with either the bot-defence interstitial or Bandcamp's
+        signup page, depending on the requesting address. ``/music`` on the same
+        host does answer a plain 404, and that is the only signal available.
+        True on that 404 and nothing else, since neither a 200 nor a challenge
+        nor a transport error is evidence of deletion.
+
+        Bypasses the challenge backoff deliberately, and must: the backoff arms
+        the moment an interstitial is seen, after which every URL is refused
+        locally for two minutes, so a confirmation issued from a caller could
+        never reach the network. That is why this lives on the client.
+
+        Costs one request per dead host, once, and only for a bare root. Not the
+        dropped fingerprint ladder, which spent one on *every* genuine 404
+        forever. Known gap: the root is unparsed here, so a live host serving no
+        ``/music`` page would read as deleted while it was only challenged.
+        Never observed, and dropping this leaves dead hosts undetectable from
+        any challenged address, which is the form they take there.
+        """
+        if not _is_bare_host_root(url):
+            return False
+        music_url = url.rstrip("/") + "/music"
+        self._wait_between_requests(crawl=crawl)
+        try:
+            response = self._session.get(music_url, timeout=REQUEST_TIMEOUT)
+        except _HTTP_EXCEPTIONS as e:
+            logger.error(f"Host confirmation GET failed for {music_url}: {e}")
+            return False
+        if response.status_code == 404:
+            return True
+        logger.debug(f"Host confirmation for {url}: /music answered {response.status_code}, not gone.")
+        return False
 
     def _retry_on_fallbacks(
         self, url: str, params: dict | None, crawl: bool
@@ -328,6 +407,10 @@ class BandcampClient:
         self._session.close()
         self._session = session
         self.impersonate = name
+        # Otherwise the new primary stays in its own fallback list: every later
+        # 404 pays a second request to the same fingerprint, and the answer is
+        # reported in ``confirmed_by`` as if another fingerprint had agreed.
+        self._fallback_impersonate = tuple(n for n in self._fallback_impersonate if n != name)
 
     def _guard_challenge_backoff(self, url: str) -> None:
         """Fail fast while a previously seen challenge is still cooling down."""
