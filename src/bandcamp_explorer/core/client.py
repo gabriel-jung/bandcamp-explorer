@@ -3,6 +3,7 @@
 import json
 import time
 from pathlib import Path
+from typing import NoReturn
 from urllib.parse import urlsplit
 
 from curl_cffi import requests as curl_requests
@@ -20,7 +21,9 @@ _CHALLENGE_SCAN_BYTES = 8192
 
 CHALLENGE_BACKOFF_SECONDS = 120.0
 
-# curl_cffi's "chrome" alias floats to the newest build it ships.
+# curl_cffi's "chrome" alias floats to the newest build it ships. It follows
+# curl_cffi releases, not Bandcamp's blocks, so it is no protection against a
+# block on its current build: ``challenge_fallback_impersonate`` is for that.
 DEFAULT_IMPERSONATE = "chrome"
 
 # Opt-in escape hatch for a host that finds one fingerprint answered a 404 where
@@ -30,9 +33,15 @@ DEFAULT_IMPERSONATE = "chrome"
 # fallback on every genuine 404, and every 404 is genuine until shown otherwise.
 FALLBACK_IMPERSONATE: tuple[str, ...] = ()
 
-# A starting point, not a claim that any of these is blocked. Several builds of
-# one browser share a failure axis, so a block on a build range can catch them
-# all at once; different engines fail independently and come first. The Chrome
+# Opt-in failover for a fingerprint Bandcamp's bot defence has started to
+# challenge. Off by default: with it on, every challenged page costs one extra
+# request, whether or not the fingerprint had anything to do with it.
+CHALLENGE_FALLBACK_IMPERSONATE: tuple[str, ...] = ()
+
+# A starting point for either list, not a claim that any of these is blocked.
+# Several builds of one browser share a failure axis, so a block on a build
+# range can catch them all at once; other engines are off that axis and come
+# first. The Chrome
 # entry is a recent build on purpose: older ones have been measured challenged
 # on at least one host, and a challenged fallback corroborates nothing while
 # still costing a request. Measure with scripts/probe_fingerprints.py.
@@ -41,6 +50,12 @@ SUGGESTED_FALLBACK_IMPERSONATE = ("firefox144", "safari184", "chrome136")
 # One 404 on the primary can be transient, which is too little to hand the
 # session to another fingerprint for the rest of its life.
 PROMOTE_AFTER_RESCUES = 2
+
+# A page can be challenged without the fingerprint being blocked, and a fallback
+# that gets through one says little about the primary. Several rescues by the
+# same fallback, with no page served by the primary in between, are what a
+# blocked fingerprint looks like.
+CHALLENGE_PROMOTE_AFTER_RESCUES = 3
 
 
 def _known_impersonate_targets() -> frozenset[str]:
@@ -100,7 +115,30 @@ class ChallengeError(Exception):
     Kept separate from :class:`NotFoundError` on purpose: a challenge means
     "ask again later", never "this resource is gone". Callers that flag
     deleted entries must not treat it as a 404.
+
+    Raised directly only when Bandcamp itself served the interstitial. A request
+    refused locally during the backoff that follows raises the subclass
+    :class:`ChallengeBackoffError` instead.
     """
+
+
+class ChallengeBackoffError(ChallengeError):
+    """Raised without touching the network while a challenge backoff is active.
+
+    A subclass so ``except ChallengeError`` still catches it. Catch it first to
+    tell "the client declined to ask" from "Bandcamp challenged this request";
+    ``retry_after`` is the number of seconds the backoff has left.
+    """
+
+    def __init__(self, url: str, retry_after: float):
+        # Both arguments go to ``args`` so the exception survives pickling,
+        # which rebuilds it as ``cls(*args)``.
+        super().__init__(url, retry_after)
+        self.url = url
+        self.retry_after = retry_after
+
+    def __str__(self) -> str:
+        return f"Challenge backoff active, {self.retry_after:.0f}s left (blocked: {self.url})"
 
 
 def _is_challenge(text: str) -> bool:
@@ -138,12 +176,16 @@ class BandcampClient:
     ``CHALLENGE_BACKOFF_SECONDS`` rather than hammering a blocked endpoint.
     Failing fast (instead of sleeping) keeps the backoff usable from a
     Discord command handler, which cannot block for two minutes.
+
+    ``impersonate`` names the fingerprint in use. It changes when a fallback is
+    promoted, so read it at the time of logging rather than once at startup.
     """
 
     def __init__(
         self,
         impersonate: str = DEFAULT_IMPERSONATE,
         fallback_impersonate: tuple[str, ...] = FALLBACK_IMPERSONATE,
+        challenge_fallback_impersonate: tuple[str, ...] = CHALLENGE_FALLBACK_IMPERSONATE,
     ):
         """Build a client on a chosen TLS fingerprint.
 
@@ -153,6 +195,13 @@ class BandcampClient:
             fallback_impersonate: fingerprints to re-check a 404 against, tried
                 in order. Pass ``()`` to disable the ladder and let every 404
                 raise immediately.
+            challenge_fallback_impersonate: fingerprints to re-send a challenged
+                request on, one per challenge, moving down the list each time
+                the current one is challenged too. One that keeps serving what
+                the primary is challenged on takes over the session. Only a
+                served page counts: a 404 or an error from a fallback is never
+                returned in place of the challenge. See
+                ``SUGGESTED_FALLBACK_IMPERSONATE``. Off by default.
         """
         self.rate_limit_seconds = 1.0
         self.crawl_delay = 5.0
@@ -161,6 +210,9 @@ class BandcampClient:
         self.impersonate = impersonate
         self._fallback_impersonate = self._usable_fallbacks(impersonate, fallback_impersonate)
         self._rescues: dict[str, int] = {}
+        self._challenge_fallbacks = self._usable_fallbacks(impersonate, challenge_fallback_impersonate)
+        self._challenge_cursor = 0
+        self._challenge_rescues: dict[str, int] = {}
         self._session = curl_requests.Session(impersonate=impersonate)
         logger.debug(f"HTTP client initialized on {impersonate}.")
 
@@ -194,7 +246,10 @@ class BandcampClient:
         One challenge does not raise: a challenged *host root* is re-checked on
         ``/music`` first, and a 404 there raises ``NotFoundError`` instead,
         because a dead host's root cannot answer 404 itself. See
-        :meth:`host_root_is_gone`.
+        :meth:`host_root_is_gone`. After that, with challenge fallbacks
+        configured, the request is re-sent once on the next of them, and its
+        page is used when it served one. ``ChallengeBackoffError``
+        means the request never left the client.
         """
         self._guard_challenge_backoff(url)
         self._wait_between_requests(crawl=crawl)
@@ -206,28 +261,44 @@ class BandcampClient:
             response.raise_for_status()
             text = response.text
         except NotFoundError:
+            # The ladder skips challenged fallbacks, so a rescued body is never
+            # the interstitial and needs none of the handling below.
             rescued, confirmed_by = self._retry_on_fallbacks(url, params, crawl)
             if rescued is None:
                 raise NotFoundError(url, confirmed_by)
-            text = rescued
+            return rescued
         except _HTTP_EXCEPTIONS as e:
             logger.error(f"GET failed for {url}: {e}")
             return None
         # Outside the except block: a challenge must not be downgraded to None.
+        if not _is_challenge(text):
+            self._challenge_rescues.clear()
+            return text
         # A parameterised request is not a bare host root even when its URL is:
         # the confirmation would fetch /music without those params and answer a
         # question nobody asked.
         confirmable = not params
-        if confirmable and _is_challenge(text) and self.host_root_is_gone(url, crawl=crawl):
+        if confirmable and self.host_root_is_gone(url, crawl=crawl):
             logger.warning(f"Challenged host root {url} is gone: /music answered 404.")
             raise NotFoundError(url)
-        self._check_challenge(text, url)
-        return text
+        # A host root that survived the check above can still be a dead host
+        # whose /music could not be read, and its signup page would then count
+        # as a rescue. Serve it, but keep it out of the promotion count.
+        rescued = self._challenge_failover(
+            url,
+            lambda session: session.get(url, params=params, timeout=REQUEST_TIMEOUT),
+            crawl,
+            counts=not (confirmable and _is_bare_host_root(url)),
+        )
+        if rescued is None:
+            self._raise_challenge(url)
+        return rescued
 
     def post_json(self, url: str, payload: dict, crawl: bool = False) -> dict | None:
         """POST with JSON body, return parsed JSON response or None on failure.
 
-        Raises ``ChallengeError`` on a bot-defence response.
+        Raises ``ChallengeError`` on a bot-defence response that the challenge
+        fallbacks, when configured, could not get past either.
         """
         self._guard_challenge_backoff(url)
         self._wait_between_requests(crawl=crawl)
@@ -238,7 +309,14 @@ class BandcampClient:
         except _HTTP_EXCEPTIONS as e:
             logger.error(f"POST failed for {url}: {e}")
             return None
-        self._check_challenge(text, url)
+        if not _is_challenge(text):
+            self._challenge_rescues.clear()
+        else:
+            text = self._challenge_failover(
+                url, lambda session: session.post(url, json=payload, timeout=REQUEST_TIMEOUT), crawl
+            )
+            if text is None:
+                self._raise_challenge(url)
         try:
             return json.loads(text)
         except ValueError as e:
@@ -390,7 +468,7 @@ class BandcampClient:
         return None, tuple(confirmed_by)
 
     def _promote(self, name: str, session, url: str) -> None:
-        """Adopt a fallback fingerprint for the rest of this client's life.
+        """Adopt a fallback fingerprint after it rescued repeated 404s.
 
         Called once a fingerprint has rescued ``PROMOTE_AFTER_RESCUES`` separate
         pages, which is what separates a soft-blocked primary from a one-off
@@ -403,13 +481,76 @@ class BandcampClient:
             f"{PROMOTE_AFTER_RESCUES} pages it 404'd, most recently {url}. "
             f"Switching this client to {name}."
         )
+        self._adopt(name, session)
+
+    def _challenge_failover(self, url: str, send, crawl: bool, counts: bool = True) -> str | None:
+        """Re-send a challenged request once, on the next challenge fallback.
+
+        ``send`` performs the request on a session it is given. Returns the
+        body when the fallback served the page, or ``None`` when there is no
+        fallback or it did not serve it, and the caller then raises the
+        challenge as it would have. A 404 or an error status from a fallback is
+        never returned: turning a challenge into a ``NotFoundError`` on one
+        fingerprint's word would make this invent deletions.
+
+        Only one fallback is asked per challenge, so a page that would be
+        challenged on any fingerprint costs one extra request, not one per
+        fallback. A fallback challenged too moves the cursor to the next one,
+        so a block covering the first fallback as well is stepped past on the
+        next challenge. Rescues are counted per fallback and survive those
+        pages; a page the primary serves clears them. The first fallback to
+        reach ``CHALLENGE_PROMOTE_AFTER_RESCUES`` is promoted. ``counts=False``
+        serves the page without counting the rescue.
+        """
+        if not self._challenge_fallbacks:
+            return None
+        name = self._challenge_fallbacks[self._challenge_cursor]
+        self._wait_between_requests(crawl=crawl)
+        session = curl_requests.Session(impersonate=name)
+        promoted = False
+        try:
+            try:
+                response = send(session)
+                response.raise_for_status()
+                text = response.text
+            except _HTTP_EXCEPTIONS as e:
+                logger.error(f"Challenge failover on {name} failed for {url}: {e}")
+                return None
+            if _is_challenge(text):
+                logger.info(f"{url} is challenged on {self.impersonate} and on {name} alike.")
+                self._challenge_cursor = (self._challenge_cursor + 1) % len(self._challenge_fallbacks)
+                return None
+            if not counts:
+                return text
+            rescues = self._challenge_rescues.get(name, 0) + 1
+            self._challenge_rescues[name] = rescues
+            if rescues < CHALLENGE_PROMOTE_AFTER_RESCUES:
+                logger.info(f"{name} got past a challenge on {self.impersonate} for {url}.")
+                return text
+            logger.warning(
+                f"Fingerprint {self.impersonate} looks blocked: {name} got past its challenge on "
+                f"{rescues} pages since the last one it served, most recently {url}. "
+                f"Switching this client to {name}."
+            )
+            self._adopt(name, session)
+            promoted = True
+            return text
+        finally:
+            if not promoted:
+                session.close()
+
+    def _adopt(self, name: str, session) -> None:
+        """Make a fallback fingerprint the session's for the rest of this client's life."""
         self._session.close()
         self._session = session
         self.impersonate = name
-        # Otherwise the new primary stays in its own fallback list: every later
+        # Otherwise the new primary stays in its own fallback lists: every later
         # 404 pays a second request to the same fingerprint, and the answer is
         # reported in ``confirmed_by`` as if another fingerprint had agreed.
         self._fallback_impersonate = tuple(n for n in self._fallback_impersonate if n != name)
+        self._challenge_fallbacks = tuple(n for n in self._challenge_fallbacks if n != name)
+        self._challenge_cursor = 0
+        self._challenge_rescues.clear()
 
     def _guard_challenge_backoff(self, url: str) -> None:
         """Fail fast while a previously seen challenge is still cooling down."""
@@ -419,12 +560,10 @@ class BandcampClient:
         if remaining <= 0:
             self._challenge_until = 0.0
             return
-        raise ChallengeError(f"Challenge backoff active, {remaining:.0f}s left (blocked: {url})")
+        raise ChallengeBackoffError(url, remaining)
 
-    def _check_challenge(self, text: str, url: str) -> None:
-        """Raise and start backing off when a response is the bot-defence page."""
-        if not _is_challenge(text):
-            return
+    def _raise_challenge(self, url: str) -> NoReturn:
+        """Start backing off and raise for a request Bandcamp challenged."""
         self._challenge_until = time.monotonic() + CHALLENGE_BACKOFF_SECONDS
         logger.error(
             f"Bandcamp served a bot-defence challenge for {url}; "

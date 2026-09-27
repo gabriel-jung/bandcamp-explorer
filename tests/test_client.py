@@ -8,12 +8,17 @@ not proof of life either. The tests pin both directions: a live page must never
 raise ``NotFoundError``, and a host that is gone must not read as alive.
 """
 
+import contextlib
+
 import pytest
 from curl_cffi import requests as curl_requests
 
 from bandcamp_explorer.core.client import (
+    CHALLENGE_FALLBACK_IMPERSONATE,
+    CHALLENGE_PROMOTE_AFTER_RESCUES,
     FALLBACK_IMPERSONATE,
     SUGGESTED_FALLBACK_IMPERSONATE,
+    ChallengeBackoffError,
     ChallengeError,
     NotFoundError,
 )
@@ -268,7 +273,7 @@ ROOT_MUSIC = "https://gone.bandcamp.com/music"
 
 
 def test_a_challenged_host_root_whose_music_404s_raises_not_found():
-    """The reason this cannot live in a caller: ``_check_challenge`` arms the
+    """The reason this cannot live in a caller: ``_raise_challenge`` arms the
     backoff the instant it sees the interstitial, and every later URL is then
     refused locally without touching the network. Confirming has to happen
     before that, which only the client can do."""
@@ -427,3 +432,255 @@ def test_a_parameterised_request_is_not_confirmed_as_a_host_root():
         client.get(ROOT, params={"page": 2})
 
     assert FakeSession.calls == [("chrome", ROOT)]
+
+
+# --- challenge failover ---------------------------------------------------
+#
+# A bot-defence block can land on one fingerprint while others are served, and
+# some pages are challenged whatever the fingerprint. The failover has to rescue
+# the first case without promoting on the second, and cost one extra request per
+# challenge at most.
+
+CHALLENGE = FakeResponse(200, CHALLENGE_BODY)
+
+
+def _pages(n):
+    return [f"https://x.bandcamp.com/album/{i}" for i in range(n)]
+
+
+def test_challenge_failover_is_off_by_default():
+    FakeSession.responses = {"chrome": [CHALLENGE]}
+    client = make_client()
+
+    assert CHALLENGE_FALLBACK_IMPERSONATE == ()
+    with pytest.raises(ChallengeError):
+        client.get("https://x.bandcamp.com/album/a")
+    assert FakeSession.calls == [("chrome", "https://x.bandcamp.com/album/a")]
+
+
+def test_a_challenge_is_rescued_by_the_fallback_fingerprint():
+    FakeSession.responses = {"chrome": [CHALLENGE], "firefox144": [FakeResponse(200, "the real page")]}
+    client = make_client(challenge_fallback_impersonate=("firefox144",))
+
+    assert client.get("https://x.bandcamp.com/album/a") == "the real page"
+    assert client.impersonate == "chrome"
+
+
+def test_a_rescue_does_not_arm_the_backoff():
+    FakeSession.responses = {
+        "chrome": [CHALLENGE, FakeResponse(200, "next page")],
+        "firefox144": [FakeResponse(200, "the real page")],
+    }
+    client = make_client(challenge_fallback_impersonate=("firefox144",))
+
+    client.get("https://x.bandcamp.com/album/a")
+
+    assert client.get("https://x.bandcamp.com/album/b") == "next page"
+
+
+def test_consecutive_rescues_promote_the_fallback():
+    n = CHALLENGE_PROMOTE_AFTER_RESCUES
+    FakeSession.responses = {
+        "chrome": [CHALLENGE] * n,
+        "firefox144": [FakeResponse(200, f"page {i}") for i in range(n + 1)],
+    }
+    client = make_client(challenge_fallback_impersonate=("firefox144",))
+    blocked_session = client._session
+
+    for url in _pages(n):
+        client.get(url)
+
+    assert client.impersonate == "firefox144"
+    assert blocked_session.closed
+    assert client.get("https://x.bandcamp.com/album/next") == f"page {n}"
+    assert FakeSession.calls[-1] == ("firefox144", "https://x.bandcamp.com/album/next")
+
+
+def test_one_rescue_short_of_the_threshold_does_not_promote():
+    n = CHALLENGE_PROMOTE_AFTER_RESCUES - 1
+    FakeSession.responses = {"chrome": [CHALLENGE] * n, "firefox144": [FakeResponse(200)] * n}
+    client = make_client(challenge_fallback_impersonate=("firefox144",))
+
+    for url in _pages(n):
+        client.get(url)
+
+    assert client.impersonate == "chrome"
+
+
+def test_a_page_the_primary_serves_clears_the_rescues():
+    """Scattered per-page challenges on a working fingerprint must not add up
+    to a promotion over a long run."""
+    n = CHALLENGE_PROMOTE_AFTER_RESCUES
+    FakeSession.responses = {
+        "chrome": [CHALLENGE] * (n - 1) + [FakeResponse(200, "served")] + [CHALLENGE],
+        "firefox144": [FakeResponse(200)] * n,
+    }
+    client = make_client(challenge_fallback_impersonate=("firefox144",))
+
+    for url in _pages(n + 1):
+        client.get(url)
+
+    assert client.impersonate == "chrome"
+
+
+def test_a_page_challenged_on_every_fingerprint_raises_and_does_not_promote():
+    FakeSession.responses = {"chrome": [CHALLENGE], "firefox144": [CHALLENGE]}
+    client = make_client(challenge_fallback_impersonate=("firefox144",))
+
+    with pytest.raises(ChallengeError) as excinfo:
+        client.get("https://x.bandcamp.com/album/challenged-everywhere")
+
+    assert not isinstance(excinfo.value, ChallengeBackoffError)
+    assert client.impersonate == "chrome"
+
+
+def test_pages_challenged_everywhere_do_not_stop_a_blocked_primary_being_replaced():
+    """Otherwise a block on the primary, mixed with pages no fingerprint gets
+    through, would reset the count forever and never promote the fallback."""
+    n = CHALLENGE_PROMOTE_AFTER_RESCUES
+    FakeSession.responses = {
+        "chrome": [CHALLENGE] * (2 * n - 1),
+        "firefox144": [r for _ in range(n - 1) for r in (FakeResponse(200), CHALLENGE)] + [FakeResponse(200)],
+    }
+    client = make_client(challenge_fallback_impersonate=("firefox144",))
+
+    for url in _pages(2 * n - 1):
+        client._challenge_until = 0.0
+        with contextlib.suppress(ChallengeError):
+            client.get(url)
+
+    assert client.impersonate == "firefox144"
+
+
+def test_only_one_fallback_is_asked_per_challenge():
+    """A page challenged whatever the fingerprint is common, so each one costs
+    a single extra request, not one per fallback."""
+    FakeSession.responses = {
+        "chrome": [CHALLENGE],
+        "firefox144": [CHALLENGE],
+        "safari184": [FakeResponse(200)],
+    }
+    client = make_client(challenge_fallback_impersonate=("firefox144", "safari184"))
+
+    with pytest.raises(ChallengeError):
+        client.get("https://x.bandcamp.com/album/a")
+
+    assert [name for name, _ in FakeSession.calls] == ["chrome", "firefox144"]
+
+
+def test_a_challenged_fallback_hands_the_next_challenge_to_the_next_one():
+    """A block covering the first fallback as well must not stall the failover."""
+    FakeSession.responses = {"chrome": [CHALLENGE], "firefox144": [CHALLENGE]}
+    client = make_client(challenge_fallback_impersonate=("firefox144", "safari184"))
+    with pytest.raises(ChallengeError):
+        client.get("https://x.bandcamp.com/album/a")
+
+    client._challenge_until = 0.0
+    FakeSession.responses = {"chrome": [CHALLENGE], "safari184": [FakeResponse(200, "via safari")]}
+
+    assert client.get("https://x.bandcamp.com/album/b") == "via safari"
+
+
+def test_a_404_on_the_fallback_does_not_turn_a_challenge_into_a_deletion():
+    """One fingerprint's 404 is not enough to call a page gone, and counting it
+    as a rescue could promote a fingerprint that 404s everything."""
+    FakeSession.responses = {"chrome": [CHALLENGE], "firefox144": [FakeResponse(404)]}
+    client = make_client(challenge_fallback_impersonate=("firefox144",))
+
+    with pytest.raises(ChallengeError):
+        client.get("https://x.bandcamp.com/album/a")
+
+    assert client._challenge_rescues == {}
+
+
+def test_a_failed_fallback_leaves_the_challenge_standing():
+    FakeSession.responses = {"chrome": [CHALLENGE], "firefox144": [FakeResponse(503)]}
+    client = make_client(challenge_fallback_impersonate=("firefox144",))
+
+    with pytest.raises(ChallengeError):
+        client.get("https://x.bandcamp.com/album/a")
+    assert client._challenge_rescues == {}
+
+
+def test_the_404_ladder_is_untouched_by_the_challenge_fallbacks():
+    FakeSession.responses = {"chrome": [FakeResponse(404)]}
+    client = make_client(challenge_fallback_impersonate=("firefox144",))
+
+    with pytest.raises(NotFoundError):
+        client.get("https://x.bandcamp.com/album/gone")
+
+    assert FakeSession.calls == [("chrome", "https://x.bandcamp.com/album/gone")]
+
+
+def test_a_promotion_removes_the_fingerprint_from_both_lists():
+    n = CHALLENGE_PROMOTE_AFTER_RESCUES
+    FakeSession.responses = {"chrome": [CHALLENGE] * n, "firefox144": [FakeResponse(200)] * n}
+    client = make_client(
+        fallback_impersonate=("firefox144", "safari184"),
+        challenge_fallback_impersonate=("firefox144", "safari184"),
+    )
+
+    for url in _pages(n):
+        client.get(url)
+
+    assert client._fallback_impersonate == ("safari184",)
+    assert client._challenge_fallbacks == ("safari184",)
+
+
+def test_post_json_is_rescued_too():
+    FakeSession.responses = {"chrome": [CHALLENGE], "firefox144": [FakeResponse(200, '{"ok": true}')]}
+    client = make_client(challenge_fallback_impersonate=("firefox144",))
+
+    assert client.post_json("https://bandcamp.com/api/x", {}) == {"ok": True}
+
+
+def test_a_dead_host_is_still_confirmed_on_music_before_any_failover():
+    FakeSession.by_url = {ROOT: CHALLENGE, ROOT_MUSIC: FakeResponse(404)}
+    client = make_client(challenge_fallback_impersonate=("firefox144",))
+
+    with pytest.raises(NotFoundError):
+        client.get(ROOT)
+
+    assert FakeSession.calls == [("chrome", ROOT), ("chrome", ROOT_MUSIC)]
+
+
+def test_a_rescued_host_root_is_served_but_not_counted():
+    """A host root that passed the /music check can still be a dead host whose
+    /music could not be read, and its signup page would count as a rescue."""
+    FakeSession.responses = {"chrome": [CHALLENGE, CHALLENGE], "firefox144": [FakeResponse(200, "root page")]}
+    client = make_client(challenge_fallback_impersonate=("firefox144",))
+
+    assert client.get(ROOT) == "root page"
+    assert FakeSession.calls == [("chrome", ROOT), ("chrome", ROOT_MUSIC), ("firefox144", ROOT)]
+    assert client._challenge_rescues == {}
+
+
+# --- local backoff refusals -----------------------------------------------
+
+
+def test_a_backoff_refusal_is_distinguishable_from_a_real_challenge():
+    FakeSession.responses = {"chrome": [CHALLENGE]}
+    client = make_client()
+
+    with pytest.raises(ChallengeError) as first:
+        client.get("https://x.bandcamp.com/album/a")
+    with pytest.raises(ChallengeBackoffError) as second:
+        client.get("https://x.bandcamp.com/album/b")
+
+    assert not isinstance(first.value, ChallengeBackoffError)
+    assert second.value.retry_after > 0
+    assert second.value.url == "https://x.bandcamp.com/album/b"
+    assert len(FakeSession.calls) == 1
+
+
+def test_a_backoff_refusal_is_still_a_challenge_error():
+    assert issubclass(ChallengeBackoffError, ChallengeError)
+
+
+def test_a_backoff_refusal_survives_pickling():
+    import pickle
+
+    error = pickle.loads(pickle.dumps(ChallengeBackoffError("https://x.bandcamp.com", 42.0)))
+
+    assert (error.url, error.retry_after) == ("https://x.bandcamp.com", 42.0)
+    assert "42s left" in str(error)

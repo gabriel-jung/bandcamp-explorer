@@ -10,6 +10,7 @@ from .api import AlbumAPI, ArtistAPI, DiscoverWebAPI, SearchAPI
 from .client import (
     SUGGESTED_FALLBACK_IMPERSONATE,
     BandcampClient,
+    ChallengeBackoffError,
     ChallengeError,
     NotFoundError,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "AlbumAPI",
     "ArtistAPI",
     "BandcampClient",
+    "ChallengeBackoffError",
     "ChallengeError",
     "NotFoundError",
     "DiscoverWebAPI",

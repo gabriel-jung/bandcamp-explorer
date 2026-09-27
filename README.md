@@ -136,7 +136,7 @@ with BandcampClient() as client:
     # Search (one call returns the whole result set)
     results = SearchAPI(client).search("caladan brood", item_type="album")
 
-    # Discover releases by tag (new discover_web endpoint)
+    # Discover releases by tag
     discover = DiscoverWebAPI(client)
     releases, cursor, total = discover.discover(tags=["dungeon-synth"], slice_="new")
     all_releases = discover.discover_all(tags=["dungeon-synth"], max_pages=3)
@@ -161,12 +161,7 @@ with BandcampClient() as client:
 
 ### Errors
 
-`AlbumAPI.get` and `ArtistAPI.get` raise `NotFoundError` when a page 404s, so
-callers can tell a deleted release from a failed fetch. Every other transport
-failure returns `None`. If Bandcamp answers with its bot-defence interstitial
-(HTTP 200 with no content in it), the client raises `ChallengeError` and then
-fails fast for two minutes rather than hammering a blocked endpoint. Never
-treat a `ChallengeError` as a missing resource; it means "ask again later".
+`AlbumAPI.get` and `ArtistAPI.get` raise `NotFoundError` when a page 404s, so callers can tell a deleted release from a failed fetch. Every other transport failure returns `None`. If Bandcamp answers with its bot-defence interstitial, the client raises `ChallengeError` and then fails fast for two minutes, raising the subclass `ChallengeBackoffError` without touching the network. Never treat a `ChallengeError` as a missing resource; it means "ask again later".
 
 ```python
 from bandcamp_explorer.core import ChallengeError, NotFoundError
@@ -179,47 +174,17 @@ except ChallengeError:
     ...  # blocked for now, retry later
 ```
 
-One case does not follow that split. The root page of an artist subdomain that
-no longer exists never answers 404: it answers HTTP 200 with either the
-bot-defence interstitial or Bandcamp's signup page, so nothing read off the
-root tells a deleted host from a live one. Since 0.8.0, when a host root
-produces no artist, `/music` on the same host is asked before any conclusion is
-drawn, and a 404 there raises `NotFoundError` where earlier versions raised
-`ChallengeError` or returned an artist with no name. Any other answer keeps the
-old behaviour: only a real 404 is read as gone. It costs one extra request per
-dead host, once.
+A deleted artist subdomain is also reported as `NotFoundError`, even though its root page never answers 404.
 
 ### TLS fingerprints
 
-`impersonate` picks the curl_cffi fingerprint the session uses, defaulting to
-the floating `"chrome"` alias. Worth changing if Bandcamp starts refusing the
-default one.
+`impersonate` picks the curl_cffi fingerprint (default: the floating `"chrome"` alias). Worth changing if Bandcamp starts challenging it.
 
 ```python
 client = BandcampClient(impersonate="firefox144")
 ```
 
-`fallback_impersonate` is an escape hatch for a host that finds one
-fingerprint answered a 404 where another served the page: it re-checks a 404 on
-other fingerprints before raising, and names the ones that agreed in
-`NotFoundError.confirmed_by`. That situation has not been reproduced here, and
-the ladder is off by default since it costs an extra request per fallback on
-every genuine 404. `scripts/probe_fingerprints.py` measures which fingerprints
-work from the machine that will run the fetches, reading response bodies rather
-than status codes because a blocked fingerprint answers HTTP 200 with a
-bot-defence interstitial, which a status-code-only probe scores as success.
-
-```python
-from bandcamp_explorer.core import SUGGESTED_FALLBACK_IMPERSONATE
-
-client = BandcampClient(fallback_impersonate=SUGGESTED_FALLBACK_IMPERSONATE)
-```
-
-> Bandcamp removed the `dig_deeper` hub endpoint, so `DiscoverAPI` was dropped
-> in 0.6.0; use `DiscoverWebAPI`. `resolve_location` went with it: it resolved
-> Bandcamp's internal location *tag* ids, which only that endpoint accepted.
-> `DiscoverWebAPI` filters by `geoname_id`, so `resolve_geoname` is the one you
-> want.
+`challenge_fallback_impersonate` re-sends a challenged request on another fingerprint, and `fallback_impersonate` re-checks a 404 on one. Both are off by default; `SUGGESTED_FALLBACK_IMPERSONATE` is a starting list.
 
 ## License
 
