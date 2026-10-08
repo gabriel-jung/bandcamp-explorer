@@ -12,6 +12,7 @@ from .client import (
     BandcampClient,
     ChallengeBackoffError,
     ChallengeError,
+    HostRootCheck,
     NotFoundError,
 )
 from .countries import resolve_geoname
@@ -23,6 +24,7 @@ __all__ = [
     "BandcampClient",
     "ChallengeBackoffError",
     "ChallengeError",
+    "HostRootCheck",
     "NotFoundError",
     "DiscoverWebAPI",
     "SUGGESTED_FALLBACK_IMPERSONATE",

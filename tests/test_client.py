@@ -20,6 +20,7 @@ from bandcamp_explorer.core.client import (
     SUGGESTED_FALLBACK_IMPERSONATE,
     ChallengeBackoffError,
     ChallengeError,
+    HostRootCheck,
     NotFoundError,
 )
 
@@ -368,6 +369,43 @@ def test_host_root_is_gone_refuses_anything_that_is_not_a_bare_root():
     assert not client.host_root_is_gone("https://x.bandcamp.com/music")
     assert not client.host_root_is_gone("https://x.bandcamp.com/?x=1")
     assert FakeSession.calls == []
+
+
+def test_check_host_root_hands_back_a_live_music_page():
+    """The caller whose root named nobody reads the artist from this body, so
+    discarding it would cost a second request for a page already downloaded."""
+    FakeSession.by_url = {ROOT_MUSIC: FakeResponse(200, "the music page")}
+    client = make_client()
+
+    check = client.check_host_root(ROOT)
+
+    assert check == HostRootCheck(gone=False, music_html="the music page")
+    assert FakeSession.calls == [("chrome", ROOT_MUSIC)]
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (FakeResponse(404), HostRootCheck(gone=True)),
+        (FakeResponse(200, CHALLENGE_BODY), HostRootCheck(gone=False, challenged=True)),
+        (FakeResponse(503), HostRootCheck(gone=False)),
+    ],
+)
+def test_check_host_root_hands_back_no_body_unless_it_is_a_real_page(response, expected):
+    """A challenge body in particular must never reach a parser as an artist."""
+    FakeSession.by_url = {ROOT_MUSIC: response}
+    client = make_client()
+
+    assert client.check_host_root(ROOT) == expected
+
+
+def test_a_challenged_music_page_during_confirmation_does_not_arm_the_backoff():
+    FakeSession.by_url = {ROOT_MUSIC: FakeResponse(200, CHALLENGE_BODY), ROOT: FakeResponse(200, "a page")}
+    client = make_client()
+
+    client.check_host_root(ROOT)
+
+    assert client.get(ROOT) == "a page"
 
 
 def test_host_root_is_gone_accepts_a_trailing_slash_without_doubling_it():

@@ -2,6 +2,7 @@
 
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 from urllib.parse import urlsplit
@@ -91,7 +92,7 @@ class NotFoundError(Exception):
     ``ChallengeError`` used to: the root page of a host that no longer exists
     never answers 404, so a bare host root that is challenged is re-checked on
     its ``/music`` subpage before the challenge is believed. See
-    :meth:`BandcampClient.host_root_is_gone`.
+    :meth:`BandcampClient.check_host_root`.
 
     ``confirmed_by`` names the fallback fingerprints that independently saw the
     same 404. It means "extra corroboration was obtained", never "this page is
@@ -139,6 +140,23 @@ class ChallengeBackoffError(ChallengeError):
 
     def __str__(self) -> str:
         return f"Challenge backoff active, {self.retry_after:.0f}s left (blocked: {self.url})"
+
+
+@dataclass(frozen=True)
+class HostRootCheck:
+    """What ``/music`` said about a host root, from :meth:`BandcampClient.check_host_root`.
+
+    ``gone`` is true on a 404 and nothing else. ``music_html`` is the ``/music``
+    body when it answered 2xx with a real page, so a caller whose root named
+    nobody can read the artist from it without a second request. It is ``None``
+    on a 404, a transport error, any other status, or the bot-defence
+    interstitial, which must never be parsed as an artist. ``challenged`` says
+    the last one happened, which means "ask again later", not "names nobody".
+    """
+
+    gone: bool
+    music_html: str | None = None
+    challenged: bool = False
 
 
 def _is_challenge(text: str) -> bool:
@@ -246,7 +264,7 @@ class BandcampClient:
         One challenge does not raise: a challenged *host root* is re-checked on
         ``/music`` first, and a 404 there raises ``NotFoundError`` instead,
         because a dead host's root cannot answer 404 itself. See
-        :meth:`host_root_is_gone`. After that, with challenge fallbacks
+        :meth:`check_host_root`. After that, with challenge fallbacks
         configured, the request is re-sent once on the next of them, and its
         page is used when it served one. ``ChallengeBackoffError``
         means the request never left the client.
@@ -278,7 +296,7 @@ class BandcampClient:
         # the confirmation would fetch /music without those params and answer a
         # question nobody asked.
         confirmable = not params
-        if confirmable and self.host_root_is_gone(url, crawl=crawl):
+        if confirmable and self.check_host_root(url, crawl=crawl).gone:
             logger.warning(f"Challenged host root {url} is gone: /music answered 404.")
             raise NotFoundError(url)
         # A host root that survived the check above can still be a dead host
@@ -373,40 +391,61 @@ class BandcampClient:
             return None
 
     def host_root_is_gone(self, url: str, crawl: bool = False) -> bool:
+        """True when ``/music`` confirms a host root belongs to a dead host.
+
+        Kept for existing callers: shorthand for ``check_host_root(url,
+        crawl).gone``, which also hands back the ``/music`` body this discards.
+        See :meth:`check_host_root` for what it costs and what counts as gone.
+        """
+        return self.check_host_root(url, crawl=crawl).gone
+
+    def check_host_root(self, url: str, crawl: bool = False) -> HostRootCheck:
         """Ask ``url + "/music"`` whether a host root belongs to a dead host.
 
         The root of a subdomain that no longer exists never answers 404: it
         answers 200 with either the bot-defence interstitial or Bandcamp's
         signup page, depending on the requesting address. ``/music`` on the same
         host does answer a plain 404, and that is the only signal available.
-        True on that 404 and nothing else, since neither a 200 nor a challenge
-        nor a transport error is evidence of deletion.
+        ``gone`` is true on that 404 and nothing else, since neither a 200 nor a
+        challenge nor a transport error is evidence of deletion.
+
+        A live host can also have a root that names nobody, for instance one
+        set to its subscription page, while its ``/music`` page is a complete
+        artist page. The 2xx body is therefore returned as ``music_html`` rather
+        than discarded, unless it is the interstitial, which sets ``challenged``.
 
         Bypasses the challenge backoff deliberately, and must: the backoff arms
         the moment an interstitial is seen, after which every URL is refused
         locally for two minutes, so a confirmation issued from a caller could
-        never reach the network. That is why this lives on the client.
+        never reach the network. That is why this lives on the client. For the
+        same reason a challenged ``/music`` does not arm the backoff here: the
+        caller decides what the challenge means once it knows the host is live.
 
         Costs one request per dead host, once, and only for a bare root. Not the
         dropped fingerprint ladder, which spent one on *every* genuine 404
-        forever. Known gap: the root is unparsed here, so a live host serving no
-        ``/music`` page would read as deleted while it was only challenged.
-        Never observed, and dropping this leaves dead hosts undetectable from
-        any challenged address, which is the form they take there.
+        forever. Known gap: :meth:`get` confirms a challenged root it never
+        parsed, so there a live host serving no ``/music`` page would read as
+        deleted while it was only challenged. Never observed, and dropping this
+        leaves dead hosts undetectable from any challenged address, which is the
+        form they take there.
         """
         if not _is_bare_host_root(url):
-            return False
+            return HostRootCheck(gone=False)
         music_url = url.rstrip("/") + "/music"
         self._wait_between_requests(crawl=crawl)
         try:
             response = self._session.get(music_url, timeout=REQUEST_TIMEOUT)
         except _HTTP_EXCEPTIONS as e:
             logger.error(f"Host confirmation GET failed for {music_url}: {e}")
-            return False
+            return HostRootCheck(gone=False)
         if response.status_code == 404:
-            return True
+            return HostRootCheck(gone=True)
         logger.debug(f"Host confirmation for {url}: /music answered {response.status_code}, not gone.")
-        return False
+        if not 200 <= response.status_code < 300:
+            return HostRootCheck(gone=False)
+        if _is_challenge(response.text):
+            return HostRootCheck(gone=False, challenged=True)
+        return HostRootCheck(gone=False, music_html=response.text)
 
     def _retry_on_fallbacks(
         self, url: str, params: dict | None, crawl: bool

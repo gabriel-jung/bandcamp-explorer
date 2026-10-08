@@ -15,11 +15,11 @@ none of this code looks at.
 import pytest
 
 from bandcamp_explorer.core.api import ArtistAPI
-from bandcamp_explorer.core.client import NotFoundError
+from bandcamp_explorer.core.client import ChallengeBackoffError, ChallengeError, NotFoundError
 from bandcamp_explorer.core.parsers import ArtistPageParser
 
 from .conftest import FakeResponse, FakeSession, make_client
-from .test_artist_parser import INDEX_BODY, INDEX_RELEASE_URLS, INDEX_URL
+from .test_artist_parser import INDEX_BODY, INDEX_RELEASE_URLS, INDEX_URL, RELEASE_BODY, RELEASE_URL
 from .test_client import CHALLENGE_BODY
 
 ROOT = "https://gone.bandcamp.com"
@@ -48,6 +48,17 @@ MUSIC_GRID_BODY = (
     "<li data-item-id='album-1'><a href='/album/one'><p class='title'>One</p></a></li>"
     "</ol></body></html>"
 )
+
+
+# A live label whose root is set to its subscription page: no band id, no name,
+# the same parse as a dead host's signup page.
+SUBSCRIBE_BODY = (
+    "<html><head><title>Subscribe to Live Label | Live Label</title></head>"
+    "<body><div id='subscribe-form'><input name='email'></div></body></html>"
+)
+
+# The same label's /music page, which carries the whole artist.
+LIVE_MUSIC_BODY = LIVE_BODY.replace("</body>", MUSIC_GRID_BODY.split("<body>")[1])
 
 
 def artist_api(**kwargs) -> ArtistAPI:
@@ -106,11 +117,12 @@ def test_a_live_artist_with_a_grid_on_the_root_makes_no_confirmation_request():
 
 
 def test_a_signup_page_root_whose_music_page_lives_is_a_failed_fetch_not_a_deletion():
-    """Only a real 404 concludes anything. A root that named nobody is not a
-    usable artist either, so this is a failed fetch to retry. It must also not
-    fall through to the discography fetch: that would send a second request to
-    the /music URL just fetched, this time through ``client.get``, where a
-    challenge arms the backoff the confirmation exists to get ahead of."""
+    """Only a real 404 concludes anything. A /music page that names nobody
+    either gives no usable artist, so this is a failed fetch to retry. It must
+    also not fall through to the discography fetch: that would send a second
+    request to the /music URL just fetched, this time through ``client.get``,
+    where a challenge arms the backoff the confirmation exists to get ahead
+    of."""
     FakeSession.by_url = {
         ROOT: FakeResponse(200, SIGNUP_BODY),
         ROOT_MUSIC: FakeResponse(200, MUSIC_GRID_BODY),
@@ -161,3 +173,104 @@ def test_an_index_page_artist_is_not_a_deleted_host():
     assert artist["name"] == "wizard ashdod"
     assert [item["url"] for item in artist["discography"]] == INDEX_RELEASE_URLS
     assert FakeSession.calls == [("chrome", INDEX_URL)]
+
+
+def test_a_subscribe_page_root_takes_the_artist_from_the_music_page():
+    """A live root can name nobody, and the /music page fetched to confirm the
+    host then holds everything. Returning None there made callers count a live
+    label as unparseable until they retired it."""
+    FakeSession.by_url = {
+        LIVE: FakeResponse(200, SUBSCRIBE_BODY),
+        LIVE_MUSIC: FakeResponse(200, LIVE_MUSIC_BODY),
+    }
+
+    artist = artist_api().get(LIVE, fetch_art=False)
+
+    assert artist["artist_id"] == "266336502"
+    assert artist["name"] == "Live Artist"
+    assert artist["url"] == LIVE
+    assert [item["title"] for item in artist["discography"]] == ["One"]
+    assert FakeSession.calls == [("chrome", LIVE), ("chrome", LIVE_MUSIC)]
+
+
+def test_a_subscribe_page_root_with_an_empty_music_grid_fetches_music_once():
+    """An artist read off /music already has that page's discography, empty or
+    not, so the supplementary fetch would only ask for the same page again."""
+    FakeSession.by_url = {LIVE: FakeResponse(200, SUBSCRIBE_BODY), LIVE_MUSIC: FakeResponse(200, LIVE_BODY)}
+
+    artist = artist_api().get(LIVE, fetch_art=False)
+
+    assert artist["name"] == "Live Artist"
+    assert artist["discography"] == []
+    assert FakeSession.calls == [("chrome", LIVE), ("chrome", LIVE_MUSIC)]
+
+
+def test_a_subscribe_page_root_with_a_challenged_music_page_raises_challenge():
+    """The interstitial is "ask again later". Returned as None it would read as
+    a page that parsed to nothing, the outcome that got live labels retired, so
+    it goes through ``client.get`` like any challenged page: the backoff arms
+    and ``ChallengeError`` is raised. Never parsed as an artist."""
+    FakeSession.by_url = {
+        LIVE: FakeResponse(200, SUBSCRIBE_BODY),
+        LIVE_MUSIC: FakeResponse(200, CHALLENGE_BODY),
+    }
+    api = artist_api()
+
+    with pytest.raises(ChallengeError):
+        api.get(LIVE, fetch_art=False)
+
+    assert FakeSession.calls == [("chrome", LIVE), ("chrome", LIVE_MUSIC), ("chrome", LIVE_MUSIC)]
+    with pytest.raises(ChallengeBackoffError):
+        api.get(LIVE, fetch_art=False)
+
+
+def test_a_subscribe_page_root_with_a_404_music_page_is_still_a_deleted_host():
+    FakeSession.by_url = {LIVE: FakeResponse(200, SUBSCRIBE_BODY), LIVE_MUSIC: FakeResponse(404)}
+
+    with pytest.raises(NotFoundError):
+        artist_api().get(LIVE, fetch_art=False)
+
+
+def test_a_subscribe_page_root_whose_music_page_fails_is_a_failed_fetch():
+    FakeSession.by_url = {LIVE: FakeResponse(200, SUBSCRIBE_BODY), LIVE_MUSIC: FakeResponse(503)}
+
+    assert artist_api().get(LIVE, fetch_art=False) is None
+    assert FakeSession.calls == [("chrome", LIVE), ("chrome", LIVE_MUSIC)]
+
+
+def test_a_single_release_artist_lists_the_release_its_music_page_redirects_to():
+    """Bandcamp redirects both the root and /music of a single-release artist to
+    that release. The root names the artist; /music is where the release is
+    read from, as the one item of the discography."""
+    FakeSession.by_url = {LIVE: FakeResponse(200, RELEASE_BODY), LIVE_MUSIC: FakeResponse(200, RELEASE_BODY)}
+
+    artist = artist_api().get(LIVE, fetch_art=False)
+
+    assert artist["name"] == "Solo"
+    assert [item["url"] for item in artist["discography"]] == [RELEASE_URL]
+
+
+def test_a_subscribe_page_root_of_a_single_release_artist_lists_its_release():
+    FakeSession.by_url = {
+        LIVE: FakeResponse(200, SUBSCRIBE_BODY),
+        LIVE_MUSIC: FakeResponse(200, RELEASE_BODY),
+    }
+
+    artist = artist_api().get(LIVE, fetch_art=False)
+
+    assert artist["url"] == LIVE
+    assert [item["url"] for item in artist["discography"]] == [RELEASE_URL]
+    assert FakeSession.calls == [("chrome", LIVE), ("chrome", LIVE_MUSIC)]
+
+
+def test_a_404_on_the_re_asked_music_page_names_the_root():
+    """A challenged confirmation is re-asked through the client. A 404 there is
+    the same evidence as the confirmation's own, and callers key on the root."""
+    FakeSession.by_url = {LIVE: FakeResponse(200, SUBSCRIBE_BODY)}
+    # Not keyed by URL: the two /music answers come off the queue in order.
+    FakeSession.responses = {"chrome": [FakeResponse(200, CHALLENGE_BODY), FakeResponse(404)]}
+
+    with pytest.raises(NotFoundError) as excinfo:
+        artist_api().get(LIVE, fetch_art=False)
+
+    assert excinfo.value.url == LIVE

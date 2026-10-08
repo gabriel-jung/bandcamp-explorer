@@ -256,3 +256,85 @@ def test_an_unparseable_data_band_blob_is_not_an_identity():
 
     assert not artist["artist_id"]
     assert not artist["name"]
+
+
+# What /music serves for an artist with a single release: Bandcamp redirects it
+# to the release, whose page names the band in data-band and the release in
+# JSON-LD. No music grid, no index-page cells.
+RELEASE_URL = "https://solo.bandcamp.com/album/only-one"
+RELEASE_BODY = (
+    "<html><head>"
+    '<script type="application/ld+json">'
+    '{"@type": "MusicAlbum", "@id": "https://solo.bandcamp.com/album/only-one", '
+    '"name": "Only One", "byArtist": {"name": "Solo"}, '
+    '"image": "https://f4.bcbits.com/img/a1_10.jpg"}'
+    "</script></head>"
+    '<body><div data-band=\'{"id":1000452676,"name":"Solo"}\'>'
+    "<p id='band-name-location'><span class='title'>Solo</span></p>"
+    "</div></body></html>"
+)
+
+
+def test_a_music_page_redirected_to_its_only_release_lists_that_release():
+    page = parse(RELEASE_BODY, "https://solo.bandcamp.com/music", discography_only=True, music_page=True)
+
+    assert page["discography"] == [
+        {
+            "_type": "album",
+            "title": "Only One",
+            "artist_name": None,
+            "item_type": "album",
+            "url": RELEASE_URL,
+            "art_url": "https://f4.bcbits.com/img/a1_10.jpg",
+        }
+    ]
+
+
+def test_a_root_landing_on_a_release_lists_nothing_from_it():
+    """A root set to one featured release says nothing about the others, and a
+    non-empty discography here would stop the /music fetch that lists them."""
+    artist = parse(RELEASE_BODY, "https://solo.bandcamp.com")
+
+    assert artist["name"] == "Solo"
+    assert artist["discography"] == []
+
+
+def test_a_release_by_another_artist_keeps_its_artist_name():
+    body = RELEASE_BODY.replace('"byArtist": {"name": "Solo"}', '"byArtist": {"name": "Guest"}')
+
+    page = parse(body, "https://solo.bandcamp.com/music", music_page=True)
+
+    assert page["discography"][0]["artist_name"] == "Guest"
+
+
+def test_a_music_page_with_no_release_json_ld_lists_nothing():
+    body = RELEASE_BODY.replace('"@id": "https://solo.bandcamp.com/album/only-one", ', "")
+
+    assert parse(body, "https://solo.bandcamp.com/music", music_page=True)["discography"] == []
+
+
+def test_a_band_page_is_never_read_as_a_single_release():
+    body = RELEASE_BODY.replace("<head>", '<head><meta property="og:type" content="band">', 1)
+
+    assert parse(body, "https://solo.bandcamp.com/music", music_page=True)["discography"] == []
+
+
+def test_a_split_release_names_its_first_artist():
+    body = RELEASE_BODY.replace(
+        '"byArtist": {"name": "Solo"}', '"byArtist": [{"name": "Guest"}, {"name": "Solo"}]'
+    )
+
+    page = parse(body, "https://solo.bandcamp.com/music", music_page=True)
+
+    assert page["discography"][0]["artist_name"] == "Guest"
+
+
+def test_a_release_url_nested_in_main_entity_of_page_is_read():
+    body = RELEASE_BODY.replace(
+        '"@id": "https://solo.bandcamp.com/album/only-one", ',
+        '"mainEntityOfPage": {"@id": "https://solo.bandcamp.com/album/only-one"}, ',
+    )
+
+    page = parse(body, "https://solo.bandcamp.com/music", music_page=True)
+
+    assert page["discography"][0]["url"] == RELEASE_URL

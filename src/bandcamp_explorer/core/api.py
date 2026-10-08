@@ -385,22 +385,22 @@ class ArtistAPI(BaseAPI):
         Since 0.8.0 it also covers what a 404 cannot express: a dead host's root
         answers 200 with Bandcamp's signup page, which parses into an artist
         with no id and no name. When the root parses and names nobody,
-        ``/music`` is asked and a 404 there means the host is gone. Anything
-        else returns ``None``.
+        ``/music`` is asked and a 404 there means the host is gone.
+
+        A live host can name nobody on its root too: observed on live labels
+        whose root is set to their subscription page. Since 0.8.3 the ``/music`` page fetched for the
+        confirmation is parsed when it answered 2xx, and if it names the artist
+        it is used, ``url`` still being the root the caller asked for. A
+        ``/music`` that names nobody either, or a failed fetch, returns
+        ``None``. A challenged one is re-asked through the client, so it gets
+        the same failover, backoff and ``ChallengeError`` as any other page.
         """
         html, artist = self._fetch_page(artist_url, ArtistPageParser)
         if html is None:
             return None
 
         if _looks_like_a_dead_host_root(artist):
-            if self._client.host_root_is_gone(artist_url):
-                logger.info(f"Artist root {artist_url} names no artist and /music is 404: host is gone.")
-                raise NotFoundError(artist_url)
-            # Falling through would re-fetch the /music URL just probed, this
-            # time through client.get, where a challenge arms the backoff the
-            # confirmation exists to get ahead of.
-            logger.warning(f"Artist root {artist_url} names no artist, and /music did not 404.")
-            return None
+            return self._artist_from_music_page(artist_url, fetch_art)
 
         if not artist:
             return None
@@ -411,6 +411,45 @@ class ArtistAPI(BaseAPI):
         if not artist.get("discography"):
             artist["discography"] = self._fetch_discography(artist_url)
 
+        return artist
+
+    def _artist_from_music_page(self, artist_url: str, fetch_art: bool) -> dict | None:
+        """Read the artist off ``/music`` for a root that named nobody.
+
+        A 404 there means the host is gone. Otherwise the body the confirmation
+        already fetched is used, so no request is repeated; its discography is
+        all that page has, so ``/music`` is not asked again for it either.
+
+        Only a challenge costs a second request. The host is known live by then,
+        so the challenge is an ordinary one and goes through ``client.get``,
+        which arms the backoff and raises ``ChallengeError``. Returned as
+        ``None`` it would read as a page that parsed to nothing.
+
+        Parsed against the root URL so the artist's ``url`` is the one callers
+        asked for and key on. ``/music`` sits at the host root, so relative
+        release links resolve the same against either URL.
+        """
+        check = self._client.check_host_root(artist_url)
+        if check.gone:
+            logger.info(f"Artist root {artist_url} names no artist and /music is 404: host is gone.")
+            raise NotFoundError(artist_url)
+        html = check.music_html
+        if check.challenged:
+            try:
+                html = self._client.get(artist_url.rstrip("/") + "/music")
+            except NotFoundError:
+                # Same evidence as the confirmation's own 404, reported under the
+                # URL the caller asked for and keys on.
+                raise NotFoundError(artist_url) from None
+        if not html:
+            logger.warning(f"Artist root {artist_url} names no artist, and /music gave no page to read.")
+            return None
+        artist = ArtistPageParser(BeautifulSoup(html, "html.parser"), artist_url, music_page=True).parse()
+        if artist is None or _looks_like_a_dead_host_root(artist):
+            logger.warning(f"Artist root {artist_url} names no artist, and neither does /music.")
+            return None
+        if fetch_art:
+            self._attach_image(artist)
         return artist
 
     def _fetch_discography(self, artist_url: str) -> list[dict]:
@@ -425,7 +464,7 @@ class ArtistAPI(BaseAPI):
         base = artist_url.rstrip("/")
         music_url = base if base.endswith("/music") else base + "/music"
         try:
-            music_page = self._get_page(music_url, ArtistPageParser, discography_only=True)
+            music_page = self._get_page(music_url, ArtistPageParser, discography_only=True, music_page=True)
         except NotFoundError:
             logger.debug(f"No /music subpage for {artist_url}")
             return []

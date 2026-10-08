@@ -243,11 +243,19 @@ class ArtistPageParser(BasePageParser):
     "index page" theme has neither, naming the band only in the ``data-band``
     JSON blob and listing releases as ``.ipCell`` anchors. Both are read, DOM
     first.
+
+    Pass ``music_page=True`` for a body fetched from ``/music``. For artists
+    with a single release, that page was observed to redirect to the release
+    itself, which is then read as a one-item discography. Never on a root: a landing page set to
+    one featured release says nothing about the others.
     """
 
-    def __init__(self, soup: BeautifulSoup, url: str, *, discography_only: bool = False):
+    def __init__(
+        self, soup: BeautifulSoup, url: str, *, discography_only: bool = False, music_page: bool = False
+    ):
         super().__init__(soup, url)
         self._discography_only = discography_only
+        self._music_page = music_page
         self._band: dict | None = None
         self._band_loaded = False
 
@@ -387,7 +395,10 @@ class ArtistPageParser(BasePageParser):
         """
         music_grid = self.soup.find("ol", id="music-grid")
         if not music_grid:
-            return self._parse_index_page_discography()
+            items = self._parse_index_page_discography()
+            if not items and self._music_page:
+                items = self._parse_release_page_discography()
+            return items
 
         items = []
 
@@ -443,6 +454,59 @@ class ArtistPageParser(BasePageParser):
                 )
 
         return items
+
+    def _parse_release_page_discography(self) -> list[dict]:
+        """The one release a redirected ``/music`` landed on, or ``[]``.
+
+        Read from the release page's JSON-LD, whose ``@id`` is the release URL.
+        Typed from that URL like the index-page cells, so anything that is not
+        an album or track page yields nothing. An artist page declares
+        ``og:type`` "band" (and carries no JSON-LD on the pages checked), so a
+        page saying so is never read as a single release.
+        """
+        og_type = self.soup.find("meta", property="og:type")
+        if og_type and og_type.get("content") == "band":
+            return []
+        tag = self.soup.find("script", type="application/ld+json")
+        if not tag or not tag.string:
+            return []
+        try:
+            data = json.loads(tag.string)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(data, dict):
+            return []
+        url = data.get("@id") or data.get("mainEntityOfPage")
+        if isinstance(url, dict):
+            url = url.get("@id")
+        if not isinstance(url, str):
+            return []
+        item_type = _release_type(url)
+        if not item_type:
+            return []
+
+        # Reported only when it differs from the band, as on the grid. A split
+        # release can list several artists; the first is the one shown.
+        by_artist = data.get("byArtist")
+        if isinstance(by_artist, list):
+            by_artist = by_artist[0] if by_artist else None
+        band_name = clean_text(str(self._band_data().get("name") or ""))
+        artist_name = by_artist.get("name") if isinstance(by_artist, dict) else None
+        artist_name = clean_text(str(artist_name or "")) or None
+        if artist_name and band_name and artist_name.casefold() == band_name.casefold():
+            artist_name = None
+
+        image = data.get("image")
+        return [
+            {
+                "_type": "album",
+                "title": clean_text(str(data.get("name") or "")),
+                "artist_name": artist_name,
+                "item_type": item_type,
+                "url": strip_tracker(url),
+                "art_url": image if isinstance(image, str) else None,
+            }
+        ]
 
     def _parse_index_page_discography(self) -> list[dict]:
         """Extract release items from the custom "index page" theme.
