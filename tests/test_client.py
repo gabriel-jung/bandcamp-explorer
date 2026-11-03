@@ -1,11 +1,13 @@
 """Tests for the HTTP client: fingerprint selection, the 404 fallback ladder,
 and the dead-host confirmation on ``/music``.
 
-Two separate traps live here. Bandcamp can answer one TLS fingerprint a 404 on
-a page another fetches fine, so a bare 404 is not proof of deletion; and the
-root of a host that no longer exists never answers 404 at all, so a bare 200 is
-not proof of life either. The tests pin both directions: a live page must never
-raise ``NotFoundError``, and a host that is gone must not read as alive.
+Two separate concerns live here. The optional fallback ladder re-checks a 404 on
+other fingerprints, for callers who want a deletion corroborated before acting
+on it (a per-fingerprint 404 has not been reproduced; the ladder is off by
+default). Separately, the root of a host that no longer exists never answers 404
+at all, so a bare 200 is not proof of life. The tests pin both directions: a
+live page must never raise ``NotFoundError``, and a host that is gone must not
+read as alive.
 """
 
 import contextlib
@@ -166,8 +168,8 @@ def test_not_found_error_stays_outside_the_request_exception_hierarchy():
 
 def test_the_ladder_is_off_by_default():
     """Nobody pays for the re-check unless they asked for it. The blocking it
-    guards against is environment specific, and with it on every genuine 404
-    costs an extra request per fallback."""
+    would guard against has not been reproduced, and with it on every genuine
+    404 costs an extra request per fallback."""
     assert FALLBACK_IMPERSONATE == ()
     assert make_client()._fallback_impersonate == ()
 

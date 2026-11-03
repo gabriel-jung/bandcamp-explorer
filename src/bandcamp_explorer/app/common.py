@@ -33,9 +33,11 @@ class AlbumFetcher:
         self._fetch_art = fetch_art
         self._lyrics_as_text = lyrics_as_text
 
-    def get(self, ref: str, **kwargs):
+    def get(self, ref: str, *, full: bool = False):
+        # Navigators pass ``full=``; AlbumAPI.get always returns the whole
+        # album, so it is accepted and ignored. Other options still raise.
         try:
-            entity = self._api.get(ref, fetch_art=self._fetch_art, **kwargs)
+            entity = self._api.get(ref, fetch_art=self._fetch_art)
         except NotFoundError:
             logger.warning(f"Album not found: {ref}")
             return None
@@ -54,9 +56,10 @@ class ArtistFetcher:
         self._api = ArtistAPI(client)
         self._fetch_art = fetch_art
 
-    def get(self, ref: str, **kwargs):
+    def get(self, ref: str, *, full: bool = False):
+        # Same as AlbumFetcher.get: ``full=`` is accepted and ignored.
         try:
-            return self._api.get(ref, fetch_art=self._fetch_art, **kwargs)
+            return self._api.get(ref, fetch_art=self._fetch_art)
         except NotFoundError:
             logger.warning(f"Artist not found: {ref}")
             return None
