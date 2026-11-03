@@ -4,12 +4,13 @@ Each entity type (album, artist, discover, search) has a dedicated API class.
 All data is returned as plain dicts with a ``_type`` discriminator key.
 """
 
+import threading
 from typing import Literal
 
 from bs4 import BeautifulSoup
 from loguru import logger
 
-from .client import BandcampClient, NotFoundError
+from .client import BandcampClient, FetchError, NotFoundError
 from .parsers import AlbumPageParser, ArtistPageParser
 from .utils import art_url, parse_tags, strip_tracker
 
@@ -88,22 +89,47 @@ class AlbumAPI(BaseAPI):
         return album
 
 
-class _PageFetcherState:
-    """Mutable state for ``DiscoverWebAPI.make_page_fetcher``.
+class _DiscoverPager:
+    """Offset-addressable view of the cursor-paged discover feed.
 
-    Holds the cursor, accumulated items, exhaustion flag, and the
-    server-reported total. The fetcher closure mutates this instead
-    of relying on a dict so attribute access is typed and the total
-    estimate stays monotonic.
+    Built by :meth:`DiscoverWebAPI.make_page_fetcher`. Calling it with
+    ``(start, count)`` returns ``(items, total)``, following cursors as far as
+    needed. A lock serializes calls, since the bot runs each button press in
+    its own thread and two presses must not follow the same cursor twice. A
+    failed batch raises (``FetchError``) and leaves the state as it was, so
+    the next call retries instead of treating the feed as finished.
+
+    ``total`` is an estimate until the feed is exhausted, then exact; while
+    estimating it never shrinks across calls.
     """
 
-    __slots__ = ("cursor", "exhausted", "items", "total")
+    def __init__(self, api: "DiscoverWebAPI", tags: list[str], slice_: str, geoname_id: int, batch_size: int):
+        self._api = api
+        self._query = {"tags": tags, "slice_": slice_, "geoname_id": geoname_id}
+        self._batch_size = batch_size
+        self._lock = threading.Lock()
+        self._items: list[dict] = []
+        self._cursor: str | None = None
+        self._exhausted = False
+        self._estimate = 0
 
-    def __init__(self) -> None:
-        self.cursor: str | None = None
-        self.items: list[dict] = []
-        self.exhausted: bool = False
-        self.total: int | None = None
+    def __call__(self, start: int, count: int) -> tuple[list[dict], int]:
+        with self._lock:
+            while len(self._items) < start + count and not self._exhausted:
+                results, cursor, total = self._api.discover(
+                    cursor=self._cursor, size=max(count, self._batch_size), **self._query
+                )
+                self._items.extend(results)
+                self._cursor = cursor
+                self._estimate = max(self._estimate, total or 0)
+                if not cursor or not results:
+                    self._exhausted = True
+
+            items = self._items[start : start + count]
+            if self._exhausted:
+                return items, len(self._items)
+            self._estimate = max(self._estimate, start + len(items) + count)
+            return items, self._estimate
 
 
 class DiscoverWebAPI(BaseAPI):
@@ -147,6 +173,10 @@ class DiscoverWebAPI(BaseAPI):
         Returns:
             Tuple of (results, next_cursor, total_count). ``next_cursor`` is
             ``None`` when there are no more pages.
+
+        Raises:
+            FetchError: If the request failed or Bandcamp answered with an
+                error payload (``ChallengeError`` for a bot-defence page).
         """
         payload = {
             "category_id": category_id,
@@ -160,10 +190,9 @@ class DiscoverWebAPI(BaseAPI):
         }
 
         data = self._client.post_json(DISCOVER_WEB_URL, payload, crawl=True)
-        if not data:
-            return [], None, 0
+        raise_for_error_payload(DISCOVER_WEB_URL, data)
 
-        items = data.get("results", [])
+        items = data.get("results") or []
         results = []
         for item in items:
             image = item.get("primary_image") or {}
@@ -206,6 +235,10 @@ class DiscoverWebAPI(BaseAPI):
 
         Stops when the server stops returning a cursor, when a batch is
         empty, or when ``max_pages`` is reached.
+
+        Raises:
+            FetchError: If any batch fails; batches already fetched are not
+                returned as if they were the whole feed.
         """
         all_results: list[dict] = []
         cursor: str | None = None
@@ -233,39 +266,26 @@ class DiscoverWebAPI(BaseAPI):
         geoname_id: int = 0,
         batch_size: int = 40,
     ):
-        """Build a ``(start, count) -> (items, total)`` fetcher.
+        """Build a ``(start, count) -> (items, total)`` fetcher over the feed.
 
-        Wraps cursor pagination in a closure so callers can address items
-        by offset, as both the CLI pager and the Discord navigator do.
-        ``total`` is an estimate until the feed is exhausted, then exact.
-        Estimates never shrink across calls.
+        Lets callers address items by offset, as both the CLI pager and the
+        Discord navigator do. Safe to call from several threads. ``total`` is
+        an estimate until the feed is exhausted, then exact; while estimating
+        it never shrinks. A failed batch raises ``FetchError`` and the next
+        call retries it.
         """
-        state = _PageFetcherState()
+        return _DiscoverPager(self, tags, slice_, geoname_id, batch_size)
 
-        def fetch(start: int, count: int) -> tuple[list[dict], int]:
-            while len(state.items) < start + count and not state.exhausted:
-                results, cursor, total = self.discover(
-                    tags=tags,
-                    slice_=slice_,
-                    cursor=state.cursor,
-                    size=max(count, batch_size),
-                    geoname_id=geoname_id,
-                )
-                state.items.extend(results)
-                state.cursor = cursor
-                if total and (state.total is None or total > state.total):
-                    state.total = total
-                if not cursor or not results:
-                    state.exhausted = True
 
-            items = state.items[start : start + count]
-            if state.exhausted:
-                total_out = len(state.items)
-            else:
-                total_out = max(state.total or 0, start + len(items) + count)
-            return items, total_out
+def raise_for_error_payload(url: str, data: dict) -> None:
+    """Raise ``FetchError`` if a JSON body reports an error instead of results.
 
-        return fetch
+    Bandcamp's JSON endpoints answer 200 with ``{"error": true,
+    "error_message": ...}`` (either key alone counts) when they refuse a call.
+    """
+    if data.get("error") or data.get("error_message"):
+        message = data.get("error_message") or "no message"
+        raise FetchError(f"Bandcamp answered with an error: {message}", url=url)
 
 
 def _search_result(item: dict) -> dict | None:
@@ -331,6 +351,10 @@ class SearchAPI(BaseAPI):
 
         Returns:
             List of entity dicts (artist, album, and/or track).
+
+        Raises:
+            FetchError: If the request failed or Bandcamp answered with an
+                error payload (``ChallengeError`` for a bot-defence page).
         """
         payload = {
             "search_text": query,
@@ -340,8 +364,7 @@ class SearchAPI(BaseAPI):
         }
 
         data = self._client.post_json(SEARCH_URL, payload)
-        if not data:
-            return []
+        raise_for_error_payload(SEARCH_URL, data)
 
         items = (data.get("auto") or {}).get("results") or []
         results = [mapped for item in items if (mapped := _search_result(item))]

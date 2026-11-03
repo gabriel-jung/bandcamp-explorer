@@ -2,8 +2,6 @@
 
 import re
 
-from rich_metadata import format_duration
-
 # Bandcamp writes durations as "P00H03M45S", which omits the ISO-8601 "T"
 # separator. The optional T keeps the standard "PT3M45S" form working too, so
 # a switch upstream would not silently drop every duration. The lookahead
@@ -69,6 +67,17 @@ def track_time_to_seconds(raw: str | None) -> int | None:
     if parts is None:
         return None
     return parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def format_duration(seconds: int) -> str:
+    """Format total seconds as "H:MM:SS" or "M:SS".
+
+    Kept here rather than imported from a rendering toolkit, so the core
+    package has no terminal dependencies.
+    """
+    h, remainder = divmod(seconds, 3600)
+    m, s = divmod(remainder, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def format_track_time(raw: str | None) -> str | None:

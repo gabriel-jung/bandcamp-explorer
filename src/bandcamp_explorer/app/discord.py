@@ -191,10 +191,8 @@ def _build_bot() -> tuple[MetadataBot, BandcampClient, DiscoverWebAPI]:
         # entity; tracklist items have no "url" key and still render inline.
         "track": SyncAPI(AlbumFetcher(client, fetch_art=False, lyrics_as_text=True)),
         "artist": SyncAPI(ArtistFetcher(client, fetch_art=False)),
+        # One search API; each command picks the item type per call.
         "search": SyncAPI(SearchAdapter(client)),
-        "album_search": SyncAPI(SearchAdapter(client, "album")),
-        "artist_search": SyncAPI(SearchAdapter(client, "band")),
-        "track_search": SyncAPI(SearchAdapter(client, "track")),
     }
     navigator = BaseNavigator(
         engine,
@@ -226,10 +224,12 @@ async def _reply(interaction: discord.Interaction, message: str) -> None:
         await interaction.response.send_message(message)
 
 
-async def _search(interaction: discord.Interaction, query: str, api_key: str) -> None:
-    """Run a search command, surfacing a challenge instead of an empty result."""
+async def _search(interaction: discord.Interaction, query: str, item_type: str) -> None:
+    """Run a search command, surfacing a challenge instead of a generic error."""
     try:
-        await bot.navigator.search_and_navigate(interaction, query, [api_key])
+        await bot.navigator.search_and_navigate(
+            interaction, query, ["search"], search_kwargs={"item_type": item_type}
+        )
     except ChallengeError:
         await _reply(interaction, CHALLENGE_MESSAGE)
 
@@ -237,25 +237,25 @@ async def _search(interaction: discord.Interaction, query: str, api_key: str) ->
 @bandcamp.command(name="search", description="Search Bandcamp")
 @app_commands.describe(query="Search query")
 async def cmd_search(interaction: discord.Interaction, query: str):
-    await _search(interaction, query, "search")
+    await _search(interaction, query, "all")
 
 
 @bandcamp.command(name="album", description="Search for an album")
 @app_commands.describe(query="Album title")
 async def cmd_album(interaction: discord.Interaction, query: str):
-    await _search(interaction, query, "album_search")
+    await _search(interaction, query, "album")
 
 
 @bandcamp.command(name="artist", description="Search for an artist")
 @app_commands.describe(query="Artist or label name")
 async def cmd_artist(interaction: discord.Interaction, query: str):
-    await _search(interaction, query, "artist_search")
+    await _search(interaction, query, "band")
 
 
 @bandcamp.command(name="track", description="Search for a track")
 @app_commands.describe(query="Track title")
 async def cmd_track(interaction: discord.Interaction, query: str):
-    await _search(interaction, query, "track_search")
+    await _search(interaction, query, "track")
 
 
 _SLICE_CHOICES = [
@@ -279,7 +279,10 @@ async def cmd_discover(
     location: str | None = None,
 ):
     await interaction.response.defer()
-    tags = [t.strip().replace(" ", "-") for t in tag.split(",")]
+    tags = [t.strip().replace(" ", "-") for t in tag.split(",") if t.strip()]
+    if not tags:
+        await interaction.followup.send("Give at least one tag, e.g. dungeon-synth.")
+        return
     slice_val = slice.value if slice else "new"
 
     try:
@@ -287,7 +290,9 @@ async def cmd_discover(
         if location:
             geoname_id = await asyncio.to_thread(resolve_geoname, _client, location) or 0
             if not geoname_id:
-                await interaction.followup.send(f"Unknown location: **{location}**")
+                await interaction.followup.send(
+                    f"Unknown location: **{discord.utils.escape_markdown(location)}**"
+                )
                 return
 
         fetcher = _discover_api.make_page_fetcher(tags=tags, slice_=slice_val, geoname_id=geoname_id)

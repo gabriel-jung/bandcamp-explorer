@@ -115,6 +115,8 @@ bandcamp https://erang.bandcamp.com/album/tome-iv --full   # all sections at onc
 bandcamp -v ...                             # enable debug logging
 ```
 
+With `--json`, stdout carries only JSON (`[]` when nothing matched) and messages go to stderr. The exit status is 0 on success (including "no results"), 1 when a request failed, a page is gone or a location is unknown, 2 for invalid flags, and 130 when a `--json` or `--full` run is interrupted. JSON items keep their `_type` (`album`, `artist`, `track`).
+
 ### Terminal images
 
 Album covers and artist images render inline on terminals that support the
@@ -161,10 +163,10 @@ with BandcampClient() as client:
 
 ### Errors
 
-`AlbumAPI.get` and `ArtistAPI.get` raise `NotFoundError` when a page 404s, so callers can tell a deleted release from a failed fetch. Every other transport failure returns `None`. If Bandcamp answers with its bot-defence interstitial, the client raises `ChallengeError` and then fails fast for two minutes, raising the subclass `ChallengeBackoffError` without touching the network. Never treat a `ChallengeError` as a missing resource; it means "ask again later".
+`AlbumAPI.get` and `ArtistAPI.get` raise `NotFoundError` when a page 404s, so callers can tell a deleted release from a failed fetch; any other transport failure of a page fetch returns `None`. Search, discover and location lookups raise `FetchError` instead when their request fails or Bandcamp answers with an error, so a failure never reads as "no results". If Bandcamp answers with its bot-defence interstitial, the client raises `ChallengeError` (a `FetchError` subclass) and then fails fast for two minutes, raising the subclass `ChallengeBackoffError` without touching the network. Never treat a `ChallengeError` as a missing resource; it means "ask again later".
 
 ```python
-from bandcamp_explorer.core import ChallengeError, NotFoundError
+from bandcamp_explorer.core import ChallengeError, FetchError, NotFoundError
 
 try:
     album = AlbumAPI(client).get(url)
@@ -172,6 +174,11 @@ except NotFoundError:
     ...  # gone for good, stop retrying
 except ChallengeError:
     ...  # blocked for now, retry later
+
+try:
+    results = SearchAPI(client).search("caladan brood")
+except FetchError:
+    ...  # the search failed; this is not an empty result
 ```
 
 A deleted artist subdomain is also reported as `NotFoundError`, even though its root page never answers 404.

@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
+from rich.console import Console
 from rich.panel import Panel
 from rich_metadata import (
     BaseNavigator,
@@ -27,14 +29,14 @@ from rich_metadata import (
     SummaryField,
     TableColumn,
     configure_logging,
+    escape,
     links_line,
     list_fetcher,
-    strip_internal_keys,
 )
 
 from .. import __version__
 from ..core.api import DiscoverWebAPI, SearchAPI
-from ..core.client import BandcampClient, ChallengeError
+from ..core.client import BandcampClient, ChallengeError, FetchError
 from ..core.countries import resolve_geoname
 from ..core.format import (
     album_host,
@@ -45,6 +47,11 @@ from ..core.format import (
     supporters_label,
 )
 from .common import AlbumFetcher, ArtistFetcher
+
+
+def _text(fn):
+    """Wrap a plain-text transform so remote text cannot be read as Rich markup."""
+    return lambda value: escape(fn(value) or "")
 
 
 def _render_lyrics(console, entity):
@@ -61,8 +68,8 @@ def _render_lyrics(console, entity):
         console.print()
         console.print(
             Panel(
-                track["lyrics"].strip(),
-                title=header,
+                escape(track["lyrics"].strip()),
+                title=escape(header),
                 border_style="dim",
                 width=min(80, console.width),
             )
@@ -78,7 +85,7 @@ track_def = EntityDef(
         SummaryField(key="artist", style="dim"),
         SummaryField(key="duration", style="dim"),
     ],
-    header_title=lambda d: f"[bold]{d.get('title', '')}[/bold]",
+    header_title=lambda d: f"[bold]{escape(d.get('title', ''))}[/bold]",
     header_fields=[
         HeaderField("Artist", key="artist"),
         HeaderField("Album", key="album_name"),
@@ -96,33 +103,33 @@ album_def = EntityDef(
     type_name="album",
     summary=[
         SummaryField(key="artist_name", style="bold"),
-        SummaryField(transform=lambda d: album_title_with_duration(d, prefix="- ")),
+        SummaryField(transform=_text(lambda d: album_title_with_duration(d, prefix="- "))),
         SummaryField(
-            transform=lambda d: ", ".join(d.get("tags", [])[:3]),
+            transform=_text(lambda d: ", ".join(d.get("tags", [])[:3])),
             style="dim",
         ),
-        SummaryField(transform=album_summary_extras, style="dim"),
+        SummaryField(transform=_text(album_summary_extras), style="dim"),
     ],
-    header_title=lambda d: f"[bold]{d.get('title', '')}[/bold]",
+    header_title=lambda d: f"[bold]{escape(d.get('title', ''))}[/bold]",
     header_image_key="_art_data",
     header_fields=[
         HeaderField("Artist", key="artist_name"),
-        HeaderField("Host", transform=album_host),
+        HeaderField("Host", transform=_text(album_host)),
         HeaderField("Label", key="label"),
-        HeaderField("Date", key="release_date", transform=format_date),
-        HeaderField("Type", key="release_type", transform=release_type),
+        HeaderField("Date", key="release_date", transform=_text(format_date)),
+        HeaderField("Type", key="release_type", transform=_text(release_type)),
         HeaderField(
             "Formats",
-            transform=lambda d: ", ".join(d.get("formats", [])),
+            transform=_text(lambda d: ", ".join(d.get("formats", []))),
         ),
         HeaderField("Catalog", key="catalog"),
-        HeaderField("Tags", transform=lambda d: ", ".join(d.get("tags", []))),
+        HeaderField("Tags", transform=_text(lambda d: ", ".join(d.get("tags", [])))),
         HeaderField(
             "Location",
-            transform=lambda d: d.get("artist", {}).get("location", ""),
+            transform=_text(lambda d: d.get("artist", {}).get("location", "")),
         ),
         HeaderField("URL", key="url"),
-        HeaderField("Supporters", transform=supporters_label),
+        HeaderField("Supporters", transform=_text(supporters_label)),
     ],
     sections=[
         SectionDef(
@@ -205,20 +212,39 @@ artist_def = EntityDef(
 engine = DisplayEngine()
 engine.register(track_def, album_def, artist_def)
 console = engine.console
+err_console = Console(stderr=True)  # messages, so --json output on stdout stays parseable
+
+# Exit statuses
+EXIT_OK, EXIT_FAILED, EXIT_INTERRUPTED = 0, 1, 130  # invalid flags exit 2 via parser.error
+
+
+def _public(obj):
+    """Drop internal ``_`` keys (image bytes, render helpers) but keep ``_type``."""
+    if isinstance(obj, dict):
+        return {k: _public(v) for k, v in obj.items() if k == "_type" or not k.startswith("_")}
+    if isinstance(obj, list):
+        return [_public(item) for item in obj]
+    return obj
+
+
+def _print_json(data) -> None:
+    """Print data as JSON on stdout. ``_type`` stays, so mixed search results stay tellable apart."""
+    sys.stdout.write(json.dumps(_public(data), indent=2, ensure_ascii=False) + "\n")
+    sys.stdout.flush()  # a closed pipe raises here, inside main(), not at interpreter exit
 
 
 # ─── Engine & navigator setup ────────────────────────────────────────────────
 
 
-def _make_navigator(client: BandcampClient) -> BaseNavigator:
-    """Create a navigator wired to all Bandcamp APIs."""
+def _make_navigator(client: BandcampClient, *, fetch_art: bool = True) -> BaseNavigator:
+    """Create a navigator wired to all Bandcamp APIs (``fetch_art=False`` skips image bytes)."""
     apis = {
-        "album": AlbumFetcher(client),
+        "album": AlbumFetcher(client, fetch_art=fetch_art),
         # Track search results carry a /track/ URL, which parses as an album
         # entity flagged is_track. Items inside an album's tracklist have no
         # "url" key, so they still render inline without a fetch.
-        "track": AlbumFetcher(client),
-        "artist": ArtistFetcher(client),
+        "track": AlbumFetcher(client, fetch_art=fetch_art),
+        "artist": ArtistFetcher(client, fetch_art=fetch_art),
         "search": SearchAPI(client),
         "discover": DiscoverWebAPI(client),
     }
@@ -348,44 +374,50 @@ def _is_bandcamp_url(text):
     return text.startswith(("http://", "https://")) or "bandcamp.com/" in text
 
 
-def _run_url(nav, args):
+def _run_url(nav, url, args) -> int:
     """Fetch and display a Bandcamp URL directly."""
-    url = " ".join(args.query)
     entity_type = "album" if "/album/" in url or "/track/" in url else "artist"
     entity = nav.fetch_entity(entity_type, url)
 
     if not entity:
-        console.print("[red]Failed to fetch page.[/red]")
-        return
+        err_console.print("[red]Could not fetch that page (gone, or the request failed).[/red]")
+        return EXIT_FAILED
 
-    nav.display_or_navigate(entity, json_output=args.json, full=args.full)
+    if args.json:
+        _print_json(entity)  # same encoding as the search and tag dumps
+    else:
+        nav.display_or_navigate(entity, full=args.full)
+    return EXIT_OK
 
 
-def _run_search(nav, args):
+def _run_search(nav, query, args) -> int:
     """Text search. The endpoint returns the whole result set in one call."""
     search = nav.apis["search"]
-    query = " ".join(args.query)
     item_type = _resolve_item_type(args)
 
-    with console.status("Searching..."):
+    with err_console.status("Searching..."):
         results = search.search(query=query, item_type=item_type)
-
-    if not results:
-        console.print("[dim]No results found.[/dim]")
-        return
 
     if args.limit:
         results = results[: args.limit]
 
     if args.json:
-        print(json.dumps(strip_internal_keys(results), indent=2, ensure_ascii=False))
-        return
+        if not results:
+            err_console.print("[dim]No results found.[/dim]")
+        _print_json(results)
+        return EXIT_OK
+
+    if not results:
+        console.print("[dim]No results found.[/dim]")
+        return EXIT_OK
 
     if args.full:
         entity = nav.fetch_entity(results[0]["_type"], results[0].get("url"))
-        if entity:
-            engine.details(entity)
-        return
+        if not entity:
+            err_console.print("[red]Could not fetch the first result.[/red]")
+            return EXIT_FAILED
+        engine.details(entity)
+        return EXIT_OK
 
     nav.browse(
         fetch_page=list_fetcher(results),
@@ -393,9 +425,10 @@ def _run_search(nav, args):
         page_size=25,
         loop=True,
     )
+    return EXIT_OK
 
 
-def _run_tag_browse(nav, client, args):
+def _run_tag_browse(nav, client, args) -> int:
     """Browse releases via the discover_web endpoint (cursor-based)."""
     api: DiscoverWebAPI = nav.apis["discover"]
     tags = [tag.replace(" ", "-") for tag in args.tag]
@@ -403,22 +436,24 @@ def _run_tag_browse(nav, client, args):
 
     geoname_id = 0
     if args.location:
-        with console.status(f"Looking up location [bold]{args.location}[/bold]..."):
+        with err_console.status(f"Looking up location [bold]{escape(args.location)}[/bold]..."):
             geoname_id = resolve_geoname(client, args.location, force=args.refresh_location) or 0
         if not geoname_id:
-            console.print(f"[red]Unknown location: {args.location}[/red]")
-            sys.exit(1)
+            err_console.print(f"[red]Unknown location: {escape(args.location)}[/red]")
+            return EXIT_FAILED
 
     # --json dumps in one pass; larger batches → far fewer round-trips.
     batch_size = 200 if args.json else 40
     fetch_page = api.make_page_fetcher(tags=tags, slice_=slice_, geoname_id=geoname_id, batch_size=batch_size)
 
-    with console.status("Searching..."):
+    with err_console.status("Searching..."):
         first_items, _ = fetch_page(0, batch_size)
 
     if not first_items:
-        console.print("[dim]No releases found.[/dim]")
-        return
+        err_console.print("[dim]No releases found.[/dim]")
+        if args.json:
+            print("[]")
+        return EXIT_OK
 
     if args.json:
         cap = args.limit
@@ -433,16 +468,17 @@ def _run_tag_browse(nav, client, args):
                 break
         if cap:
             items = items[:cap]
-        print(json.dumps(strip_internal_keys(items), indent=2, ensure_ascii=False))
-        return
+        _print_json(items)
+        return EXIT_OK
 
     if args.full:
         url = first_items[0].get("url")
-        if url:
-            entity = nav.fetch_entity("album", url)
-            if entity:
-                engine.details(entity)
-        return
+        entity = nav.fetch_entity("album", url) if url else None
+        if not entity:
+            err_console.print("[red]Could not fetch the first release.[/red]")
+            return EXIT_FAILED
+        engine.details(entity)
+        return EXIT_OK
 
     tag_label = " + ".join(tags)
     nav.browse(
@@ -451,39 +487,54 @@ def _run_tag_browse(nav, client, args):
         page_size=40,
         loop=True,
     )
+    return EXIT_OK
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 
-def main():
-    """CLI entry point: parse args, configure logging, dispatch."""
+def main() -> int:
+    """CLI entry point.
+
+    Returns the exit status: 0 done (including "no results"), 1 a request
+    failed or a page is gone, 2 invalid flags, 130 interrupted with --json or --full.
+    """
     parser = _build_parser()
     args = parser.parse_args()
 
     configure_logging(args.verbose)
-
-    has_query = bool(args.query)
-    has_tag = bool(args.tag)
-
-    if not has_query and not has_tag:
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be at least 1")
+    if not args.query and not args.tag:
         parser.error("provide a search query or use --tag for tag browsing")
+    if args.json:
+        # Prompts and messages from the navigator go to stderr; stdout carries only JSON.
+        engine.console = err_console
+    query = " ".join(args.query)
 
     with BandcampClient() as client:
-        nav = _make_navigator(client)
+        nav = _make_navigator(client, fetch_art=not args.json)
         try:
-            if has_tag:
-                _run_tag_browse(nav, client, args)
-            elif has_query and _is_bandcamp_url(" ".join(args.query)):
-                _run_url(nav, args)
-            else:
-                _run_search(nav, args)
+            if args.tag:
+                return _run_tag_browse(nav, client, args)
+            if _is_bandcamp_url(query):
+                return _run_url(nav, query, args)
+            return _run_search(nav, query, args)
         except (QuitSignal, KeyboardInterrupt):
-            pass
+            # Ctrl+C is how the interactive browser quits; in a --json or
+            # --full run it means the output is incomplete.
+            return EXIT_INTERRUPTED if args.json or args.full else EXIT_OK
+        except BrokenPipeError:
+            # The reader closed stdout early (`| head`): stop quietly.
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+            return EXIT_OK
         except ChallengeError as e:
-            console.print(
+            err_console.print(
                 "[red]Bandcamp served a bot-defence challenge and refused the request.[/red]\n"
-                f"[dim]{e}[/dim]\n"
+                f"[dim]{escape(e)}[/dim]\n"
                 "[dim]Wait a couple of minutes and try again.[/dim]"
             )
-            sys.exit(1)
+            return EXIT_FAILED
+        except FetchError as e:
+            err_console.print(f"[red]Request to Bandcamp failed: {escape(e)}[/red]")
+            return EXIT_FAILED

@@ -110,7 +110,25 @@ class NotFoundError(Exception):
         self.confirmed_by = confirmed_by
 
 
-class ChallengeError(Exception):
+class FetchError(Exception):
+    """A search, discover or location request failed: retry later.
+
+    Raised by :meth:`BandcampClient.post_json` for a network error, an HTTP
+    error status or a body that is not JSON, so those endpoints never report a
+    failure as "no results". Page fetches (:meth:`BandcampClient.get`) keep
+    returning None for the same failures. ``url`` names the request.
+    Never means the resource is gone; that is :class:`NotFoundError`.
+    """
+
+    url: str | None = None
+
+    def __init__(self, *args, url: str | None = None):
+        super().__init__(*args)
+        if url is not None:
+            self.url = url  # kept in __dict__, so it survives pickling
+
+
+class ChallengeError(FetchError):
     """Raised when Bandcamp answers with a bot-defence interstitial.
 
     Kept separate from :class:`NotFoundError` on purpose: a challenge means
@@ -119,8 +137,13 @@ class ChallengeError(Exception):
 
     Raised directly only when Bandcamp itself served the interstitial. A request
     refused locally during the backoff that follows raises the subclass
-    :class:`ChallengeBackoffError` instead.
+    :class:`ChallengeBackoffError` instead. A subclass of :class:`FetchError`,
+    so ``except FetchError`` covers it; catch it first to back off longer.
     """
+
+    def __init__(self, *args, url: str | None = None):
+        # Raised as ChallengeError(url); the URL is also the message.
+        super().__init__(*args, url=url if url is not None else (args[0] if args else None))
 
 
 class ChallengeBackoffError(ChallengeError):
@@ -312,11 +335,14 @@ class BandcampClient:
             self._raise_challenge(url)
         return rescued
 
-    def post_json(self, url: str, payload: dict, crawl: bool = False) -> dict | None:
-        """POST with JSON body, return parsed JSON response or None on failure.
+    def post_json(self, url: str, payload: dict, crawl: bool = False) -> dict:
+        """POST with JSON body and return the parsed JSON response.
 
-        Raises ``ChallengeError`` on a bot-defence response that the challenge
-        fallbacks, when configured, could not get past either.
+        Raises:
+            ChallengeError: On a bot-defence response that the challenge
+                fallbacks, when configured, could not get past either.
+            FetchError: On a network error, an HTTP error status, or a body
+                that is not JSON.
         """
         self._guard_challenge_backoff(url)
         self._wait_between_requests(crawl=crawl)
@@ -325,8 +351,7 @@ class BandcampClient:
             response.raise_for_status()
             text = response.text
         except _HTTP_EXCEPTIONS as e:
-            logger.error(f"POST failed for {url}: {e}")
-            return None
+            raise FetchError(f"POST failed: {e}", url=url) from e
         if not _is_challenge(text):
             self._challenge_rescues.clear()
         else:
@@ -336,10 +361,12 @@ class BandcampClient:
             if text is None:
                 self._raise_challenge(url)
         try:
-            return json.loads(text)
+            data = json.loads(text)
         except ValueError as e:
-            logger.error(f"POST returned a non-JSON body for {url}: {e}")
-            return None
+            raise FetchError(f"POST returned a non-JSON body: {e}", url=url) from e
+        if not isinstance(data, dict):
+            raise FetchError(f"POST returned JSON that is not an object ({type(data).__name__})", url=url)
+        return data
 
     def get_bytes(self, url: str, crawl: bool = False) -> bytes | None:
         """GET request, return raw bytes or None on failure."""

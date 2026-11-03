@@ -10,11 +10,16 @@ removed that endpoint, leaving those ids with nothing to consume them, so that
 half was dropped in 0.6.0.
 """
 
+import contextlib
 import json
+import os
 import threading
 from pathlib import Path
 
 from loguru import logger
+
+from .api import raise_for_error_payload
+from .client import FetchError
 
 CACHE_DIR = Path.home() / ".cache" / "bandcamp-explorer"
 GEONAME_CACHE_FILE = CACHE_DIR / "geonames.json"
@@ -26,6 +31,7 @@ GEONAME_SEARCH_URL = "https://bandcamp.com/api/location/1/geoname_search"
 # resolve_geoname calls from the Discord bot's worker threads.
 _MEMORY: dict[Path, dict[str, dict]] = {}
 _LOCK = threading.Lock()
+_WRITE_LOCK = threading.Lock()  # file writes, so cache reads never wait on disk I/O
 
 
 def _load_json_cache(path: Path) -> dict[str, dict]:
@@ -41,15 +47,29 @@ def _load_json_cache(path: Path) -> dict[str, dict]:
         return _MEMORY[path]
 
 
-def _save_json_cache(path: Path, data: dict[str, dict]) -> None:
-    """Atomically write a JSON cache file and refresh the in-memory mirror."""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, indent=2, ensure_ascii=False)
+def _store_json_cache(path: Path, key: str, entry: dict) -> None:
+    """Add one entry to a JSON cache file and its in-memory mirror.
+
+    The entry is added under the lock, so concurrent lookups (the bot's worker
+    threads) cannot change the dict while it is being written. Best effort:
+    the cache only saves a lookup next time, so a home directory that cannot
+    be written (a container, a locked-down account) is logged and the
+    in-memory copy is kept for this process.
+    """
     with _LOCK:
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(payload)
-        tmp.replace(path)
+        data = {**_MEMORY.get(path, {}), key: entry}
         _MEMORY[path] = data
+        payload = json.dumps(data, indent=2, ensure_ascii=False)
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
+    with _WRITE_LOCK:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(payload)
+            tmp.replace(path)
+        except OSError as e:
+            logger.warning(f"Location cache not saved ({e}): {path}")
+            with contextlib.suppress(OSError):
+                tmp.unlink()
 
 
 def resolve_geoname(client, value: str, force: bool = False) -> int | None:
@@ -65,7 +85,10 @@ def resolve_geoname(client, value: str, force: bool = False) -> int | None:
         force: If True, bypass the cache and re-fetch.
 
     Returns:
-        The geoname id, or None if the place cannot be resolved.
+        The geoname id, or None if Bandcamp knows no such place.
+
+    Raises:
+        FetchError: If the lookup request failed or Bandcamp answered with an error.
     """
     normalized = value.lower().strip()
     cache = _load_json_cache(GEONAME_CACHE_FILE)
@@ -74,8 +97,10 @@ def resolve_geoname(client, value: str, force: bool = False) -> int | None:
         return cache[normalized]["id"]
 
     data = client.post_json(GEONAME_SEARCH_URL, {"q": value})
-    if not data or not data.get("ok"):
-        return None
+    raise_for_error_payload(GEONAME_SEARCH_URL, data)
+    if not data.get("ok"):
+        # An unknown place answers ok: true with no results; ok: false is a failure.
+        raise FetchError("Location lookup was refused (ok: false)", url=GEONAME_SEARCH_URL)
 
     results = data.get("results") or []
     if not results:
@@ -87,11 +112,8 @@ def resolve_geoname(client, value: str, force: bool = False) -> int | None:
     except (KeyError, ValueError, TypeError):
         return None
 
-    cache[normalized] = {
-        "id": gid,
-        "name": top.get("name"),
-        "fullname": top.get("fullname"),
-    }
-    _save_json_cache(GEONAME_CACHE_FILE, cache)
+    _store_json_cache(
+        GEONAME_CACHE_FILE, normalized, {"id": gid, "name": top.get("name"), "fullname": top.get("fullname")}
+    )
     logger.info(f"Cached geoname: {top.get('fullname')} (id={gid})")
     return gid

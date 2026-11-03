@@ -67,11 +67,15 @@ class ArtistFetcher:
 
 class SearchAdapter:
     """Expose :class:`SearchAPI` as the ``search(query) -> list`` shape the
-    Discord navigator expects, with an item-type filter baked in."""
+    Discord navigator expects.
+
+    ``item_type`` can be given per call (the bot passes it through
+    ``search_kwargs``) and defaults to the one set at construction.
+    """
 
     def __init__(self, client: BandcampClient, item_type: str = "all"):
         self._api = SearchAPI(client)
         self._item_type = item_type
 
-    def search(self, query: str, **kwargs) -> list[dict]:
-        return self._api.search(query=query, item_type=self._item_type)
+    def search(self, query: str, item_type: str | None = None) -> list[dict]:
+        return self._api.search(query=query, item_type=item_type or self._item_type)

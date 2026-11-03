@@ -12,6 +12,7 @@ from .client import (
     BandcampClient,
     ChallengeBackoffError,
     ChallengeError,
+    FetchError,
     HostRootCheck,
     NotFoundError,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "BandcampClient",
     "ChallengeBackoffError",
     "ChallengeError",
+    "FetchError",
     "HostRootCheck",
     "NotFoundError",
     "DiscoverWebAPI",
