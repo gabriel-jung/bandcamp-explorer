@@ -89,6 +89,17 @@ class AlbumAPI(BaseAPI):
         return album
 
 
+def _discover_field(data: dict, snake_name: str):
+    """Read a ``discover_web`` field under its camelCase name, else its snake_case one.
+
+    The endpoint has served both spellings. Only ``None`` falls through, so a
+    real ``false`` or ``0`` under the camelCase name is kept.
+    """
+    head, *rest = snake_name.split("_")
+    value = data.get(head + "".join(word.capitalize() for word in rest))
+    return data.get(snake_name) if value is None else value
+
+
 class _DiscoverPager:
     """Offset-addressable view of the cursor-paged discover feed.
 
@@ -99,8 +110,10 @@ class _DiscoverPager:
     failed batch raises (``FetchError``) and leaves the state as it was, so
     the next call retries instead of treating the feed as finished.
 
-    ``total`` is an estimate until the feed is exhausted, then exact; while
-    estimating it never shrinks across calls.
+    ``total`` is an estimate one page past what was asked for until the feed
+    is exhausted, then exact; while estimating it never shrinks across calls.
+    The feed's own count is deliberately not used: navigators offer a jump to
+    the last page, and a cursor can only get there by walking every batch.
     """
 
     def __init__(self, api: "DiscoverWebAPI", tags: list[str], slice_: str, geoname_id: int, batch_size: int):
@@ -116,12 +129,11 @@ class _DiscoverPager:
     def __call__(self, start: int, count: int) -> tuple[list[dict], int]:
         with self._lock:
             while len(self._items) < start + count and not self._exhausted:
-                results, cursor, total = self._api.discover(
+                results, cursor, _ = self._api.discover(
                     cursor=self._cursor, size=max(count, self._batch_size), **self._query
                 )
                 self._items.extend(results)
                 self._cursor = cursor
-                self._estimate = max(self._estimate, total or 0)
                 if not cursor or not results:
                     self._exhausted = True
 
@@ -195,33 +207,37 @@ class DiscoverWebAPI(BaseAPI):
         items = data.get("results") or []
         results = []
         for item in items:
-            image = item.get("primary_image") or {}
-            art_id = image.get("image_id")
-            item_id = item.get("item_id")
-            band_id = item.get("band_id")
+            image = _discover_field(item, "primary_image") or {}
+            art_id = _discover_field(image, "image_id")
+            item_id = _discover_field(item, "item_id")
+            band_id = _discover_field(item, "band_id")
             results.append(
                 {
                     "_type": "album",
                     "album_id": str(item_id) if item_id else None,
-                    "artist_name": item.get("band_name"),
-                    "album_artist": item.get("album_artist"),
+                    "artist_name": _discover_field(item, "band_name"),
+                    "album_artist": _discover_field(item, "album_artist"),
                     "title": item.get("title"),
-                    "url": strip_tracker(item.get("item_url")),
-                    "artist_url": strip_tracker(item.get("band_url")),
+                    "url": strip_tracker(_discover_field(item, "item_url")),
+                    "artist_url": strip_tracker(_discover_field(item, "band_url")),
                     "artist_id": str(band_id) if band_id else None,
                     "art_id": str(art_id) if art_id else None,
                     "genre": "",
-                    "item_type": item.get("item_type"),
-                    "release_date": item.get("release_date"),
-                    "location": item.get("band_location"),
-                    "track_count": item.get("track_count"),
+                    "item_type": _discover_field(item, "item_type"),
+                    "release_date": _discover_field(item, "release_date"),
+                    "location": _discover_field(item, "band_location"),
+                    "track_count": _discover_field(item, "track_count"),
                     "duration": item.get("duration"),
                     "price": item.get("price"),
-                    "is_preorder": item.get("is_album_preorder"),
+                    "is_preorder": _discover_field(item, "is_album_preorder"),
                 }
             )
 
-        return results, data.get("cursor"), data.get("result_count", 0)
+        # A renamed key would otherwise read as a page of blank rows, not a failure.
+        if results and not any(result["album_id"] for result in results):
+            raise FetchError(f"Discover items carry no id (keys: {sorted(items[0])})", url=DISCOVER_WEB_URL)
+
+        return results, data.get("cursor"), _discover_field(data, "result_count") or 0
 
     def discover_all(
         self,
@@ -270,9 +286,9 @@ class DiscoverWebAPI(BaseAPI):
 
         Lets callers address items by offset, as both the CLI pager and the
         Discord navigator do. Safe to call from several threads. ``total`` is
-        an estimate until the feed is exhausted, then exact; while estimating
-        it never shrinks. A failed batch raises ``FetchError`` and the next
-        call retries it.
+        an estimate one page ahead until the feed is exhausted, then exact;
+        while estimating it never shrinks. A failed batch raises
+        ``FetchError`` and the next call retries it.
         """
         return _DiscoverPager(self, tags, slice_, geoname_id, batch_size)
 
@@ -282,9 +298,11 @@ def raise_for_error_payload(url: str, data: dict) -> None:
 
     Bandcamp's JSON endpoints answer 200 with ``{"error": true,
     "error_message": ...}`` (either key alone counts) when they refuse a call.
+    ``discover_web`` rejects invalid parameters with a different 200 body,
+    ``{"__api_special__": "exception", "error_type": ...}``.
     """
-    if data.get("error") or data.get("error_message"):
-        message = data.get("error_message") or "no message"
+    if data.get("error") or data.get("error_message") or data.get("__api_special__") == "exception":
+        message = data.get("error_message") or data.get("error_type") or "no message"
         raise FetchError(f"Bandcamp answered with an error: {message}", url=url)
 
 
